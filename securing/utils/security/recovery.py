@@ -26,6 +26,53 @@ class RecoverError(Exception):
         self.credentials_changed = credentials_changed
 
 
+# ResetPassword / login copy for accounts Microsoft does not recognize.
+# Keep specific — vague strings like "we don't recognize this one" / "try
+# entering your microsoft account again" appear as unused i18n on valid pages.
+_ACCOUNT_MISSING_PHRASES = (
+    "microsoft account doesn't exist",
+    "couldn't find a microsoft account",
+    "could not find a microsoft account",
+    "we couldn't find a microsoft account",
+    "we could not find a microsoft account",
+    "that microsoft account doesn't exist",
+    "that microsoft account does not exist",
+)
+
+_ACCOUNT_MISSING_REASON = "Microsoft account does not exist / not recognized."
+
+
+def _html_says_account_missing(body: str | None) -> bool:
+    if not body:
+        return False
+    low = body.lower()
+    return any(p in low for p in _ACCOUNT_MISSING_PHRASES)
+
+
+def _server_data_says_account_missing(server_data: dict | None) -> bool:
+    """ResetPassword with sErrorCode 1001/1002 = email is not an MSA.
+
+    Do NOT treat SignInNames page / SignInName action alone as missing —
+    that page also appears while tokens are still loading, on rate-limits,
+    and for valid accounts that need the email re-entered.
+    """
+    if not isinstance(server_data, dict):
+        return False
+    # Already past the gate — recovery token means the account exists
+    if server_data.get("sRecoveryToken"):
+        return False
+    err = str(server_data.get("sErrorCode") or server_data.get("iErrorCode") or "")
+    # 1001/1002 = Microsoft does not recognize this sign-in name
+    if err in ("1001", "1002"):
+        return True
+    return False
+
+
+def _raise_if_account_missing(body: str | None, server_data: dict | None = None) -> None:
+    if _html_says_account_missing(body) or _server_data_says_account_missing(server_data):
+        raise RecoverError(_ACCOUNT_MISSING_REASON, ms_code=1300)
+
+
 async def verify_password_works(
     session: httpx.AsyncClient,
     email: str,
@@ -378,16 +425,11 @@ def _verify_recovery_code_cloudscraper_sync(
         for attempt in range(3):
             resp = client.get(reset_url)
             body = resp.text or ""
-            if any(
-                p in body.lower()
-                for p in (
-                    "try entering your microsoft account again",
-                    "we don't recognize this one",
-                    "account doesn't exist",
-                )
-            ):
-                return "bad", "Microsoft account does not exist / not recognized", None
+            if _html_says_account_missing(body):
+                return "bad", _ACCOUNT_MISSING_REASON.rstrip("."), None
             server_data = _extract_server_data(body)
+            if _server_data_says_account_missing(server_data):
+                return "bad", _ACCOUNT_MISSING_REASON.rstrip("."), None
             if server_data:
                 break
             time.sleep(1)
@@ -400,11 +442,18 @@ def _verify_recovery_code_cloudscraper_sync(
                 break
             time.sleep(token_try + 1)
             resp = client.get(reset_url)
-            new_data = _extract_server_data(resp.text or "")
+            body = resp.text or ""
+            if _html_says_account_missing(body):
+                return "bad", _ACCOUNT_MISSING_REASON.rstrip("."), None
+            new_data = _extract_server_data(body)
             if new_data:
                 server_data = new_data
+            if _server_data_says_account_missing(server_data):
+                return "bad", _ACCOUNT_MISSING_REASON.rstrip("."), None
 
         if not server_data.get("sRecoveryToken") or not server_data.get("apiCanary"):
+            if _server_data_says_account_missing(server_data):
+                return "bad", _ACCOUNT_MISSING_REASON.rstrip("."), None
             return "unknown", "Recovery page tokens missing", None
 
         api_canary = server_data["apiCanary"]
@@ -523,28 +572,21 @@ def _recover_cloudscraper_sync(
     )
 
     server_data = None
+    last_body = ""
     for attempt in range(3):
         resp = client.get(reset_url)
         body = resp.text or ""
-        if any(
-            p in body.lower()
-            for p in (
-                "try entering your microsoft account again",
-                "we don't recognize this one",
-                "account doesn't exist",
-            )
-        ):
-            raise RecoverError(
-                "Microsoft account does not exist / not recognized.",
-                ms_code=1300,
-            )
+        last_body = body
+        _raise_if_account_missing(body)
         server_data = _extract_server_data(body)
+        _raise_if_account_missing(body, server_data)
         if server_data:
             break
         time.sleep(1)
 
     if not server_data:
         logging.error("cloudscraper recover: no ServerData for %s", email)
+        _raise_if_account_missing(last_body)
         return None
 
     for token_try in range(5):
@@ -552,12 +594,17 @@ def _recover_cloudscraper_sync(
             break
         time.sleep(token_try + 1)
         resp = client.get(reset_url)
-        new_data = _extract_server_data(resp.text or "")
+        body = resp.text or ""
+        last_body = body
+        _raise_if_account_missing(body)
+        new_data = _extract_server_data(body)
         if new_data:
             server_data = new_data
+        _raise_if_account_missing(body, server_data)
 
     if not server_data.get("sRecoveryToken") or not server_data.get("apiCanary"):
         logging.error("cloudscraper recover: missing tokens for %s", email)
+        _raise_if_account_missing(last_body, server_data)
         return None
 
     api_canary = server_data["apiCanary"]
@@ -767,19 +814,10 @@ async def recover(
             body_text[:1200],
         )
 
-        if any(
-            p in body_l
-            for p in (
-                "try entering your microsoft account again",
-                "we don't recognize this one",
-                "account doesn't exist",
-                "microsoft account doesn't exist",
-            )
+        if _html_says_account_missing(body_text) or _server_data_says_account_missing(
+            server_data
         ):
-            raise RecoverError(
-                "Microsoft account does not exist / not recognized.",
-                ms_code=1300,
-            )
+            raise RecoverError(_ACCOUNT_MISSING_REASON, ms_code=1300)
 
         if len(body_text) < 500 and (
             "please retry after sometime" in body_l
@@ -799,6 +837,8 @@ async def recover(
             )
 
         server_data = _extract_server_data(body_text)
+        if _server_data_says_account_missing(server_data):
+            raise RecoverError(_ACCOUNT_MISSING_REASON, ms_code=1300)
         if server_data and server_data.get("sRecoveryToken") and server_data.get("apiCanary"):
             break
 
@@ -817,9 +857,13 @@ async def recover(
         await asyncio.sleep(token_try)
         data = await session.get(url=reset_url, follow_redirects=True)
         body_text = data.text or ""
+        if _html_says_account_missing(body_text):
+            raise RecoverError(_ACCOUNT_MISSING_REASON, ms_code=1300)
         new_data = _extract_server_data(body_text)
         if new_data:
             server_data = new_data
+        if _server_data_says_account_missing(server_data):
+            raise RecoverError(_ACCOUNT_MISSING_REASON, ms_code=1300)
         logging.info(
             "recover: token retry %s/5 keys=%s",
             token_try,
@@ -836,6 +880,7 @@ async def recover(
             title,
             len(body_text),
         )
+        _raise_if_account_missing(body_text, server_data)
         body_l = body_text.lower()
         if len(body_text) < 800 or "<html" not in body_l:
             raise httpx.RemoteProtocolError(

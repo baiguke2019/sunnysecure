@@ -893,6 +893,112 @@ class DBConnection:
         self.conn.commit()
         return remaining
 
+    def get_secured_account_for_credit(self, credit_id: int) -> dict | None:
+        """Return secured credentials linked to an autobuy credit (for void give-back)."""
+        row = self.cursor.execute(
+            """
+            SELECT
+                sa.account_id,
+                sa.ms_email,
+                sa.ms_security_email,
+                sa.ms_password,
+                sa.ms_recovery_code,
+                sa.ms_auth_secret,
+                sa.mc_name,
+                c.email AS sell_email,
+                c.ms_recovery_code AS credit_ms_recovery_code,
+                c.ms_security_email AS credit_ms_security_email
+            FROM autobuy_credits c
+            LEFT JOIN autobuy_sells s
+                ON s.credit_id = c.id AND s.success = 1
+            LEFT JOIN secured_accounts sa
+                ON s.account_id IS NOT NULL
+               AND s.account_id != ''
+               AND sa.account_id = s.account_id
+            WHERE c.id = ?
+            LIMIT 1
+            """,
+            (credit_id,),
+        ).fetchone()
+        if not row:
+            return None
+        keys = [
+            "account_id",
+            "ms_email",
+            "ms_security_email",
+            "ms_password",
+            "ms_recovery_code",
+            "ms_auth_secret",
+            "mc_name",
+            "sell_email",
+            "credit_ms_recovery_code",
+            "credit_ms_security_email",
+        ]
+        item = dict(zip(keys, row))
+        # Prefer secured row; fall back to credit snapshot / sell email
+        email = (
+            (item.get("ms_email") or "").strip()
+            or (item.get("sell_email") or "").strip()
+        )
+        sec = (
+            (item.get("ms_security_email") or "").strip()
+            or (item.get("credit_ms_security_email") or "").strip()
+        )
+        pwd = (item.get("ms_password") or "").strip()
+        rc = (
+            (item.get("ms_recovery_code") or "").strip()
+            or (item.get("credit_ms_recovery_code") or "").strip()
+        )
+        if not (email or sec or pwd or rc):
+            return None
+        return {
+            "account_id": item.get("account_id"),
+            "email": email or "Unknown",
+            "security_email": sec or "Couldn't Change!",
+            "password": pwd or "Couldn't Change!",
+            "recovery_code": rc or "Couldn't Change!",
+            "auth_secret": (item.get("ms_auth_secret") or "").strip() or "Disabled",
+            "mc_name": (item.get("mc_name") or "").strip() or "Unknown",
+        }
+
+    def get_secured_account_by_email(self, email: str) -> dict | None:
+        """Newest secured_accounts row matching primary (or exact) email."""
+        email = (email or "").strip()
+        if not email:
+            return None
+        row = self.cursor.execute(
+            """
+            SELECT account_id, ms_email, ms_security_email, ms_password,
+                   ms_recovery_code, ms_auth_secret, mc_name
+            FROM secured_accounts
+            WHERE LOWER(ms_email) = LOWER(?)
+            ORDER BY secured_at DESC
+            LIMIT 1
+            """,
+            (email,),
+        ).fetchone()
+        if not row:
+            return None
+        keys = [
+            "account_id",
+            "ms_email",
+            "ms_security_email",
+            "ms_password",
+            "ms_recovery_code",
+            "ms_auth_secret",
+            "mc_name",
+        ]
+        item = dict(zip(keys, row))
+        return {
+            "account_id": item.get("account_id"),
+            "email": item.get("ms_email") or email,
+            "security_email": item.get("ms_security_email") or "Couldn't Change!",
+            "password": item.get("ms_password") or "Couldn't Change!",
+            "recovery_code": item.get("ms_recovery_code") or "Couldn't Change!",
+            "auth_secret": item.get("ms_auth_secret") or "Disabled",
+            "mc_name": item.get("mc_name") or "Unknown",
+        }
+
     def autobuy_add_withdrawal(
         self,
         discord_id: int,

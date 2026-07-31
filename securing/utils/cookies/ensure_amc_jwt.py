@@ -7,6 +7,7 @@ amc + amcjwt hop after login; our polish was skipping SSO once MSAAUTH existed.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from urllib.parse import urljoin
@@ -14,6 +15,7 @@ from urllib.parse import urljoin
 import httpx
 
 from securing.utils.cookies.safe_cookies import has_cookie
+from securing.utils.proxy import format_exception_reason
 
 log = logging.getLogger(__name__)
 
@@ -24,12 +26,26 @@ def has_amc_api_cookies(session: httpx.AsyncClient) -> bool:
     return has_cookie(session, "AMCSecAuthJWT") or has_cookie(session, "AMCSecAuth")
 
 
-async def ensure_amc_jwt(session: httpx.AsyncClient) -> bool:
+async def ensure_amc_jwt(session: httpx.AsyncClient, *, attempts: int = 2) -> bool:
     """Best-effort: walk account.microsoft.com OAuth until AMC JWT is set.
 
     Mirrors dona ``tokens/amcjwt.py`` + ``tokens/amc.py`` silent-signin.
     Returns True when an AMC API cookie is present afterwards.
+    Retries once on ReadTimeout — a lone timeout was aborting whole secure().
     """
+    if has_amc_api_cookies(session):
+        return True
+
+    for attempt in range(1, max(1, attempts) + 1):
+        ok = await _ensure_amc_jwt_once(session, attempt=attempt)
+        if ok:
+            return True
+        if attempt < attempts:
+            await asyncio.sleep(1.0 * attempt)
+    return False
+
+
+async def _ensure_amc_jwt_once(session: httpx.AsyncClient, *, attempt: int = 1) -> bool:
     if has_amc_api_cookies(session):
         return True
 
@@ -124,12 +140,13 @@ async def ensure_amc_jwt(session: httpx.AsyncClient) -> bool:
             return True
 
     except (httpx.TimeoutException, httpx.TransportError) as exc:
-        log.warning("ensure_amc_jwt transport error: %s", exc)
-        print(f"[!] - ensure_amc_jwt failed ({exc.__class__.__name__})")
+        detail = format_exception_reason(exc)
+        log.warning("ensure_amc_jwt transport error (attempt %s): %s", attempt, detail)
+        print(f"[!] - ensure_amc_jwt failed ({detail}) [attempt {attempt}]")
     except Exception:
-        log.exception("ensure_amc_jwt crashed")
+        log.exception("ensure_amc_jwt crashed (attempt %s)", attempt)
 
     ok = has_amc_api_cookies(session)
-    if not ok:
+    if not ok and attempt >= 2:
         print("[!] - No AMCSecAuthJWT — account.microsoft.com APIs will 401")
     return ok

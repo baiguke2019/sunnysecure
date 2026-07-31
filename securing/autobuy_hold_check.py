@@ -227,6 +227,14 @@ async def check_pullback_intact(
             return "ok", None
         if status == "unknown":
             return "unknown", reason or "Recovery code check inconclusive"
+        # KnowMe / HTML "does not exist" is often a false positive (proxy flake).
+        # Do not void from that alone — retry later. Real pullbacks use
+        # "Invalid or already-used recovery code" + missing security email.
+        reason_l = (reason or "").lower()
+        if "does not exist" in reason_l or (
+            "not recognized" in reason_l and "already-used" not in reason_l
+        ):
+            return "unknown", reason or "Account-status probe inconclusive"
         # RC bad → fall through to security email (same as dashboard)
         rc_bad_reason = reason or "Stored recovery code no longer valid"
     else:
@@ -324,7 +332,12 @@ async def check_security_email_intact(
 
 
 async def check_sold_account(email: str, password: str | None = None) -> tuple[str, str | None]:
-    """Lock-only check. Never verifies password (locks / rate-limits accounts)."""
+    """Lock-only check. Never verifies password (locks / rate-limits accounts).
+
+    KnowMe "does not exist" is treated as inconclusive — that API flakes with
+    EntityNotFound/500 on live accounts and previously false-voided pays.
+    Real deletions are caught by the recovery-code pullback check instead.
+    """
     del password  # intentionally unused — never password-check sold accounts
     if not (email or "").strip():
         return "unknown", "Missing email for lock check"
@@ -340,6 +353,14 @@ async def check_sold_account(email: str, password: str | None = None) -> tuple[s
         return "unknown", f"Lock check inconclusive ({exc.__class__.__name__})"
 
     if lock_reason:
+        low = lock_reason.lower()
+        if "does not exist" in low or "not recognized" in low:
+            logger.warning(
+                "autobuy lock check ignoring flaky missing-account signal for %s: %s",
+                email,
+                lock_reason,
+            )
+            return "unknown", f"Inconclusive account-status probe ({lock_reason})"
         return "bad", lock_reason
     return "ok", None
 
@@ -541,6 +562,9 @@ async def process_due_hold_checks(
         if void_reason:
             with DBConnection() as db:
                 voided = db.autobuy_void_credit(credit_id, void_reason)
+                creds = db.get_secured_account_for_credit(credit_id)
+                if not creds and email:
+                    creds = db.get_secured_account_by_email(email)
             if voided > 0:
                 stats["voided"] += 1
                 void_events.append(
@@ -551,6 +575,7 @@ async def process_due_hold_checks(
                         "amount_usd": voided or remaining,
                         "reason": void_reason,
                         "available_at": _fmt_ts(available_at) if available_at else None,
+                        "credentials": creds,
                     }
                 )
                 logger.warning(

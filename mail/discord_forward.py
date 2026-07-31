@@ -66,7 +66,7 @@ async def _post_webhook(
         response.raise_for_status()
 
 
-async def _push_otp_to_playtime(
+async def _push_otp_to_bridge(
     *,
     recipients: list[str],
     from_address: str,
@@ -94,12 +94,40 @@ async def _push_otp_to_playtime(
             response = await client.post(bridge_url, json=payload, headers=headers)
             response.raise_for_status()
         log.info(
-            "[otp-bridge] pushed to playtime for %s%s",
+            "[otp-bridge] pushed to %s for %s%s",
+            bridge_url,
             ", ".join(recipients),
             f" code={code}" if code else "",
         )
     except httpx.HTTPError as err:
-        log.warning("[otp-bridge] playtime push failed: %s", err)
+        log.warning("[otp-bridge] push to %s failed: %s", bridge_url, err)
+
+
+def _bridge_targets(mail_cfg: dict) -> list[tuple[str, str]]:
+    """Collect OTP bridge endpoints. Prefer otp_bridge_urls (fan-out to
+    playtime + cft on separate ports); fall back to legacy otp_bridge_url."""
+    token = str(mail_cfg.get("otp_bridge_token") or "")
+    urls: list[str] = []
+
+    raw_list = mail_cfg.get("otp_bridge_urls")
+    if isinstance(raw_list, list):
+        urls.extend(str(u).strip() for u in raw_list if str(u or "").strip())
+    elif isinstance(raw_list, str) and raw_list.strip():
+        urls.extend(u.strip() for u in raw_list.split(",") if u.strip())
+
+    legacy = str(mail_cfg.get("otp_bridge_url") or "").strip()
+    if legacy and legacy not in urls:
+        urls.append(legacy)
+
+    # De-dupe while preserving order
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append((url, token))
+    return out
 
 
 async def forward_email(
@@ -115,8 +143,7 @@ async def forward_email(
 
     webhook_all = mail_cfg.get("discord_webhook_all", "")
     webhook_otp = mail_cfg.get("discord_webhook_otp", "")
-    bridge_url = mail_cfg.get("otp_bridge_url", "")
-    bridge_token = mail_cfg.get("otp_bridge_token", "")
+    bridges = _bridge_targets(mail_cfg)
 
     if not webhook_all:
         return
@@ -152,15 +179,22 @@ async def forward_email(
         except httpx.HTTPError as err:
             log.warning("[discord] otp webhook failed: %s", err)
 
-    if otp.get("is_otp") and bridge_url:
-        await _push_otp_to_playtime(
-            recipients=recipients,
-            from_address=from_address,
-            subject=subject or "",
-            body=body or "",
-            code=otp.get("code"),
-            bridge_url=bridge_url,
-            bridge_token=bridge_token,
+    # Fan-out OTP to every bridge in parallel (playtime :12798 + cft :12799).
+    # One failing target must never block the others.
+    if otp.get("is_otp") and bridges:
+        await asyncio.gather(
+            *[
+                _push_otp_to_bridge(
+                    recipients=recipients,
+                    from_address=from_address,
+                    subject=subject or "",
+                    body=body or "",
+                    code=otp.get("code"),
+                    bridge_url=url,
+                    bridge_token=token,
+                )
+                for url, token in bridges
+            ]
         )
 
 

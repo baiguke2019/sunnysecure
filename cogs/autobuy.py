@@ -103,13 +103,55 @@ class Autobuy(commands.Cog):
         await self.bot.wait_until_ready()
 
     async def _dm_void(self, ev: dict) -> None:
-        """Account invalid during grace — DM seller + owners."""
+        """Account invalid during grace — DM seller + owners with returned credentials."""
         email = ev.get("email") or "?"
         reason = ev.get("reason") or "unknown"
         amount = float(ev.get("amount_usd") or 0)
         seller_id = ev.get("discord_id")
         credit_id = ev.get("credit_id")
         available = ev.get("available_at") or "unknown"
+        creds = ev.get("credentials") or {}
+        # Prefer secured primary; fall back to credit email
+        login_email = (creds.get("email") or email or "?").strip()
+        sec = (creds.get("security_email") or "").strip()
+        pwd = (creds.get("password") or "").strip()
+        rc = (creds.get("recovery_code") or "").strip()
+        auth = (creds.get("auth_secret") or "").strip()
+        mc = (creds.get("mc_name") or "").strip()
+
+        def _cred_block() -> str:
+            if not (sec or pwd or rc):
+                return (
+                    "\n\n**Credentials:** not found in DB for this credit — "
+                    "check prior sell DMs."
+                )
+            lines = [
+                "",
+                "",
+                "**Returned credentials** (account is no longer paying out — save these):",
+                f"```Login: {login_email}",
+                f"Security: {sec or 'N/A'}",
+                f"Password: {pwd or 'N/A'}",
+                f"Recovery: {rc or 'N/A'}",
+            ]
+            if auth and auth not in ("Disabled", "Couldn't Change!", "Failed", "None", "?"):
+                lines.append(f"Authenticator: {auth}")
+            if mc and mc not in ("Unknown", "No Minecraft", "N/A"):
+                lines.append(f"MC: {mc}")
+            lines.append("```")
+            copy_line = " ".join(
+                [
+                    login_email,
+                    rc or "N/A",
+                    pwd or "N/A",
+                    sec or "N/A",
+                    mc or "N/A",
+                ]
+            )
+            lines.append(f"Copy:\n```{copy_line}```")
+            return "\n".join(lines)
+
+        cred_text = _cred_block()
 
         seller_embed = discord.Embed(
             title="Credit voided — account failed hold check",
@@ -119,6 +161,7 @@ class Autobuy(commands.Cog):
                 f"**Reason:** {reason}\n\n"
                 "Credits only become withdrawable after the hold period **and** "
                 "passing periodic security-email + Microsoft lock checks."
+                f"{cred_text}"
             ),
             color=0xE74C3C,
         )
@@ -128,11 +171,13 @@ class Autobuy(commands.Cog):
             description=(
                 f"**Seller:** <@{seller_id}>\n"
                 f"**Account:** `{email}`\n"
+                f"**Login (primary):** `{login_email}`\n"
                 f"**Credit ID:** `{credit_id}`\n"
                 f"**Amount removed:** ${amount:.2f}\n"
                 f"**Reason:** {reason}\n"
                 f"**Grace was until:** `{available}`\n\n"
                 "Credit voided while still in the pending grace window."
+                f"{cred_text}"
             ),
             color=0xE74C3C,
         )

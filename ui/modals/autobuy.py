@@ -977,7 +977,17 @@ async def _autobuy_sell_callback(
                 fails += 1
                 reason = "securing failed"
                 if isinstance(account, dict):
-                    reason = account.get("reason") or reason
+                    reason = (
+                        account.get("reason")
+                        or account.get("error")
+                        or reason
+                    )
+                    # Legacy blank "Securing step failed:" (empty httpx timeout msg)
+                    if str(reason).strip() in ("", "Securing step failed:", "Securing step failed"):
+                        reason = (
+                            account.get("error")
+                            or "Securing step failed: unknown network/timeout error — retry"
+                        )
                 elif account == "invalid":
                     reason = (
                         "invalid recovery code"
@@ -1050,10 +1060,17 @@ async def _autobuy_sell_callback(
                         or "microsoft error 6001" in reason_l
                         or "microsoft error 1300" in reason_l
                     ):
-                        header = (
-                            "**Sell failed** — recovery step failed before the account "
-                            "was secured (no payout). Credentials were not changed."
-                        )
+                        if creds_changed:
+                            header = (
+                                "**Account returned** — recovery/secure step failed "
+                                "(no payout). Password/security email already changed — "
+                                "new credentials are in the embed below."
+                            )
+                        else:
+                            header = (
+                                "**Sell failed** — recovery step failed before the account "
+                                "was secured (no payout). Credentials were not changed."
+                            )
                     elif creds_changed:
                         header = (
                             "**Account returned** — secure step failed (no payout). "

@@ -49,6 +49,29 @@ def is_proxy_transport_error(exc: BaseException) -> bool:
     return isinstance(exc, PROXY_TRANSPORT_ERRORS)
 
 
+def format_exception_reason(exc: BaseException) -> str:
+    """Human-readable exception text — httpx timeouts often have empty ``str(exc)``.
+
+    Without this, Discord showed ``Securing step failed:`` with nothing after the colon.
+    """
+    name = exc.__class__.__name__
+    msg = str(exc).strip()
+    # httpx.ReadTimeout / ConnectTimeout frequently stringify to ""
+    if not msg:
+        if isinstance(exc, httpx.ReadTimeout):
+            return f"{name} (request timed out reading response)"
+        if isinstance(exc, httpx.ConnectTimeout):
+            return f"{name} (timed out connecting)"
+        if isinstance(exc, httpx.TimeoutException):
+            return f"{name} (request timed out)"
+        if isinstance(exc, httpx.TransportError):
+            return f"{name} (network/proxy transport error)"
+        return name
+    if msg.startswith(name):
+        return msg
+    return f"{name}: {msg}"
+
+
 def _load_proxy_cfg() -> dict:
     try:
         cfg = json.loads(_CONFIG_PATH.read_text())

