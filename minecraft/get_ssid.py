@@ -2,7 +2,7 @@ import logging
 
 import httpx
 
-from minecraft.retry import TransientMCError, with_retries
+from minecraft.retry import NoMinecraftEntitlement, TransientMCError, with_retries
 
 log = logging.getLogger(__name__)
 
@@ -31,16 +31,25 @@ async def _get_ssid_once(xbl: str) -> str | None:
         if "access_token" in jresponse:
             return jresponse["access_token"]
 
-        # 401/403 with error payload usually means no MC ownership — don't retry forever
         err = jresponse.get("error") or jresponse.get("errorMessage") or ""
         err_u = str(err).upper()
+        # Genuine "no entitlement" — surface distinctly (do not treat as transient)
+        if any(
+            x in err_u
+            for x in ("NO_ENTITLEMENT", "NOT_ENTITLED", "NOT_FOUND")
+        ) or (
+            response.status_code in (401, 403)
+            and any(x in err_u for x in ("FORBIDDEN", "UNAUTHORIZED"))
+            and "ENTITLEMENT" in err_u
+        ):
+            log.info("get_ssid: no MC entitlement (%s)", err or response.status_code)
+            raise NoMinecraftEntitlement(str(err or response.status_code))
+
         if response.status_code in (401, 403):
-            # Genuine "no entitlement" signals
-            if any(x in err_u for x in ("NOT_FOUND", "NO_ENTITLEMENT", "FORBIDDEN", "UNAUTHORIZED")):
-                log.info("get_ssid: no MC entitlement (%s)", err or response.status_code)
-                return None
             # Auth races return 401 briefly after XBL mint
-            raise TransientMCError(f"login_with_xbox auth race: {err or response.status_code}")
+            raise TransientMCError(
+                f"login_with_xbox auth race: {err or response.status_code}"
+            )
 
         return None
 
