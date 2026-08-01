@@ -1,8 +1,9 @@
 """Sticky residential proxy helpers (host:port:user:pass).
 
 Supports:
-- niceproxy:  ...-ssid-XXXX-sst-60
-- vaultproxies: ...-s-XXXX-ttl-3600
+- niceproxy:     user ...-ssid-XXXX-sst-60
+- vaultproxies:  user ...-s-XXXX-ttl-3600
+- iproyal:       pass ..._session-XXXX_lifetime-30m  (session lives in password)
 """
 
 from __future__ import annotations
@@ -27,6 +28,10 @@ _CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "config.json"
 # niceproxy: ssid-XXXX ; vaultproxies: -s-XXXX-ttl-N (avoid matching -sst-)
 _SSID_RE = re.compile(r"(ssid-)([A-Za-z0-9]+)", re.I)
 _VAULT_S_RE = re.compile(r"(?<![A-Za-z0-9])(s-)([A-Za-z0-9]+)(?=-ttl-)", re.I)
+# iproyal: password like 8cMH…_country-us_session-ljur4QXZ_lifetime-30m
+_IPROYAL_SESSION_RE = re.compile(
+    r"(_session-)([A-Za-z0-9]+)(?=_lifetime-)", re.I
+)
 
 T = TypeVar("T")
 
@@ -81,9 +86,13 @@ def _load_proxy_cfg() -> dict:
         return {}
 
 
-def _random_ssid(length: int = 8) -> str:
-    alphabet = string.ascii_lowercase + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(length))
+def _random_ssid(length: int = 8, *, mixed_case: bool = False) -> str:
+    alphabet = (
+        (string.ascii_letters + string.digits)
+        if mixed_case
+        else (string.ascii_lowercase + string.digits)
+    )
+    return "".join(secrets.choice(alphabet) for _ in range(max(4, length)))
 
 
 def _parse_line(line: str) -> dict | None:
@@ -107,32 +116,76 @@ def _parse_line(line: str) -> dict | None:
     }
 
 
-def _session_id_from_user(username: str) -> str:
-    m = _SSID_RE.search(username)
-    if m:
-        return m.group(2)
-    m = _VAULT_S_RE.search(username)
-    if m:
-        return m.group(2)
+def _session_id_from_creds(username: str, password: str = "") -> str:
+    for value in (username, password):
+        if not value:
+            continue
+        for pat in (_SSID_RE, _VAULT_S_RE, _IPROYAL_SESSION_RE):
+            m = pat.search(value)
+            if m:
+                return m.group(2)
     return "?"
 
 
-def _with_fresh_ssid(username: str) -> str:
-    """Replace sticky session id in username with a fresh random one."""
+def _session_id_from_user(username: str) -> str:
+    """Back-compat helper — prefer ``_session_id_from_creds``."""
+    return _session_id_from_creds(username, "")
+
+
+def _rotate_sticky(username: str, password: str) -> tuple[str, str]:
+    """Mint a fresh sticky session id for the configured provider.
+
+    IPRoyal keeps ``_session-XXXX_lifetime-…`` in the *password*; Vault/Niceproxy
+    keep it in the username. Never fall back to appending vault-style tags onto
+    an IPRoyal username (that breaks auth).
+    """
     if _SSID_RE.search(username):
-        return _SSID_RE.sub(
-            lambda m: m.group(1) + _random_ssid(len(m.group(2)) or 10),
-            username,
-            count=1,
+        return (
+            _SSID_RE.sub(
+                lambda m: m.group(1) + _random_ssid(len(m.group(2)) or 10),
+                username,
+                count=1,
+            ),
+            password,
         )
     if _VAULT_S_RE.search(username):
-        return _VAULT_S_RE.sub(
-            lambda m: m.group(1) + _random_ssid(len(m.group(2)) or 8),
-            username,
-            count=1,
+        return (
+            _VAULT_S_RE.sub(
+                lambda m: m.group(1) + _random_ssid(len(m.group(2)) or 8),
+                username,
+                count=1,
+            ),
+            password,
         )
-    # Fallback: append vault-style sticky segment (1h)
-    return f"{username}-s-{_random_ssid(8)}-ttl-3600"
+    # IPRoyal (and similar): session token in password
+    if _IPROYAL_SESSION_RE.search(password):
+        return (
+            username,
+            _IPROYAL_SESSION_RE.sub(
+                lambda m: m.group(1)
+                + _random_ssid(len(m.group(2)) or 8, mixed_case=True),
+                password,
+                count=1,
+            ),
+        )
+    if _IPROYAL_SESSION_RE.search(username):
+        return (
+            _IPROYAL_SESSION_RE.sub(
+                lambda m: m.group(1)
+                + _random_ssid(len(m.group(2)) or 8, mixed_case=True),
+                username,
+                count=1,
+            ),
+            password,
+        )
+    # Fallback: append vault-style sticky segment (1h) to username
+    return f"{username}-s-{_random_ssid(8)}-ttl-3600", password
+
+
+def _with_fresh_ssid(username: str) -> str:
+    """Replace sticky session id in username (Vault/Niceproxy). Prefer ``_rotate_sticky``."""
+    user, _ = _rotate_sticky(username, "")
+    return user
 
 
 def build_proxy_url() -> str | None:
@@ -153,15 +206,17 @@ def build_proxy_url() -> str | None:
         return None
 
     base = random.choice(parsed)
-    user = _with_fresh_ssid(base["username"]) if cfg.get("rotate_ssid", True) else base["username"]
+    user, password = base["username"], base["password"]
+    if cfg.get("rotate_ssid", True):
+        user, password = _rotate_sticky(user, password)
     user_q = quote(user, safe="-._~")
-    pass_q = quote(base["password"], safe="-._~")
+    pass_q = quote(password, safe="-._~")
     scheme = (cfg.get("scheme") or "http").strip().lower()
     if scheme not in ("http", "https", "socks5", "socks5h"):
         scheme = "http"
     host = (cfg.get("host_override") or base["host"]).strip()
     url = f"{scheme}://{user_q}:{pass_q}@{host}:{base['port']}"
-    sid = _session_id_from_user(user)
+    sid = _session_id_from_creds(user, password)
     print(f"[~] - Proxy sticky s={sid} via {host}:{base['port']} ({scheme})")
     log.info("Using proxy %s:%s session=%s scheme=%s", host, base["port"], sid, scheme)
     return url

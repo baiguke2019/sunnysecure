@@ -478,19 +478,43 @@ async def recovery_secure(
                 if pwd_status == "ok":
                     print("[+] - Password verified OK")
                 elif pwd_status == "bad":
-                    # Do NOT hammer RecoverUser here — it burns rate-limits, delays
-                    # OTP mail, and still leaves password UNVERIFIED. Fix after OTP
-                    # via authenticated ChangePassword / ResetPassword.
-                    password = f"{password} (UNVERIFIED — may not work)"
+                    # RecoverUser often rotates RC while ignoring password.
+                    # Fix immediately via security-email OTC → ResetPassword
+                    # (passwordchange.har) — does not burn the new recovery code.
                     print(
                         "[!] - Password did NOT stick after RecoverUser — "
-                        "skipping force retries; OTP then ChangePassword"
+                        "trying security-email OTP ResetPassword"
                     )
                     logging.error(
                         "Password not applied for %s after RecoverUser — "
-                        "deferring fix until after OTP login",
+                        "trying OTP ResetPassword",
                         email,
                     )
+                    try:
+                        from securing.utils.security.force_password import (
+                            force_password_via_otp,
+                        )
+
+                        forced_pwd, forced_ok = await force_password_via_otp(
+                            email=email,
+                            security_email=security_email,
+                            preferred_password=password,
+                        )
+                        if forced_ok:
+                            password = forced_pwd
+                            pwd_status = "ok"
+                            print("[+] - Password stuck via OTP ResetPassword")
+                        else:
+                            password = f"{forced_pwd} (UNVERIFIED — may not work)"
+                            print(
+                                "[!] - OTP ResetPassword did not verify — "
+                                "will retry after login via ensure_password_verified"
+                            )
+                    except Exception:
+                        logging.exception(
+                            "OTP ResetPassword force failed for %s", email
+                        )
+                        password = f"{password} (UNVERIFIED — may not work)"
                 else:
                     # Inconclusive (rate-limit) — one longer settle before continuing.
                     # Do NOT mark UNVERIFIED; post-login ensure_password_verified
@@ -506,12 +530,29 @@ async def recovery_secure(
                         pwd_status = "ok"
                         print("[+] - Password verified OK on delayed re-check")
                     elif pwd_status2 == "bad":
-                        password = f"{password} (UNVERIFIED — may not work)"
-                        pwd_status = "bad"
                         print(
                             "[!] - Delayed re-check BAD — "
-                            "OTP then authenticated ChangePassword"
+                            "trying security-email OTP ResetPassword"
                         )
+                        try:
+                            from securing.utils.security.force_password import (
+                                force_password_via_otp,
+                            )
+
+                            forced_pwd, forced_ok = await force_password_via_otp(
+                                email=email,
+                                security_email=security_email,
+                                preferred_password=password,
+                            )
+                            if forced_ok:
+                                password = forced_pwd
+                                pwd_status = "ok"
+                            else:
+                                password = f"{forced_pwd} (UNVERIFIED — may not work)"
+                                pwd_status = "bad"
+                        except Exception:
+                            password = f"{password} (UNVERIFIED — may not work)"
+                            pwd_status = "bad"
                     else:
                         print("[~] - Password verify still inconclusive (continuing)")
 

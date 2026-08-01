@@ -41,14 +41,18 @@ def _find_canary(html: str) -> str | None:
 
 
 def _find_user_ticket(html: str) -> str | None:
-    """Extract ChangePassword userTicket / iPostedTicket from page HTML."""
+    """Extract ChangePassword userTicket / iPostedTicket from page HTML.
+
+    Never use manage ``addPassword.postTicket`` — that passwordless ticket
+    returns Microsoft JSON error 500 on normal accounts (see passwordchange.har
+    vs live ChangePassword failures).
+    """
     for pat in (
         r'id="iPostedTicket"[^>]*value="([^"]+)"',
         r'name="iPostedTicket"[^>]*value="([^"]+)"',
-        # Prefer page ticket over addPassword.postTicket (passwordless-only)
         r'"sPostedTicket"\s*:\s*"((?:\\.|[^"\\])*)"',
+        # Avoid bare "postTicket" — matches addPassword.postTicket
         r'"postedTicket"\s*:\s*"((?:\\.|[^"\\])*)"',
-        r'"postTicket"\s*:\s*"((?:\\.|[^"\\])*)"',
         r'"userTicket"\s*:\s*"((?:\\.|[^"\\])*)"',
     ):
         m = re.search(pat, html or "", re.I)
@@ -203,34 +207,30 @@ async def change_password_authenticated(
             }
         )
 
-    endpoints = (
-        ("ChangePassword", "https://account.live.com/API/ChangePassword"),
-        ("ResetPassword", "https://account.live.com/API/Recovery/ResetPassword"),
-    )
-
+    # Only authenticated /API/ChangePassword here.
+    # /API/Recovery/ResetPassword needs epid + a: OTC token (see
+    # reset_password_via_security_email_otp) — userTicket payloads always 500.
+    endpoint = "https://account.live.com/API/ChangePassword"
     headers = _ms_headers(canary, referer=referer)
-    for label, endpoint in endpoints:
-        for payload in payloads:
-            try:
-                resp = await session.post(endpoint, json=payload, headers=headers)
-            except Exception:
-                logger.exception("%s POST failed", label)
-                continue
-            try:
-                data = resp.json()
-            except Exception:
-                logger.error(
-                    "%s non-JSON status=%s body=%s",
-                    label,
-                    resp.status_code,
-                    (resp.text or "")[:300],
-                )
-                continue
-            if _ok_response(data, label):
-                return True
-            # refresh canary if MS rotated it
-            if isinstance(data, dict) and data.get("apiCanary"):
-                headers = _ms_headers(str(data["apiCanary"]), referer=referer)
+    for payload in payloads:
+        try:
+            resp = await session.post(endpoint, json=payload, headers=headers)
+        except Exception:
+            logger.exception("ChangePassword POST failed")
+            continue
+        try:
+            data = resp.json()
+        except Exception:
+            logger.error(
+                "ChangePassword non-JSON status=%s body=%s",
+                resp.status_code,
+                (resp.text or "")[:300],
+            )
+            continue
+        if _ok_response(data, "ChangePassword"):
+            return True
+        if isinstance(data, dict) and data.get("apiCanary"):
+            headers = _ms_headers(str(data["apiCanary"]), referer=referer)
 
-    print("[X] - Authenticated password change failed on all endpoints")
+    print("[X] - Authenticated ChangePassword failed — will try OTP ResetPassword")
     return False

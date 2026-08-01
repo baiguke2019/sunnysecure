@@ -1168,3 +1168,375 @@ async def recover(
 
     logging.error("RecoverUser missing recoveryCode after retries: %s", last_json)
     return None
+
+
+def _poll_email_otp_sync(
+    mail: str,
+    timeout: float = 90,
+    *,
+    since: float | None = None,
+) -> str | None:
+    """Blocking OTP poll for cloudscraper worker threads."""
+    import time
+
+    from securing.utils.cookies.get_email_code import (
+        _extract_otp,
+        _is_skippable_notification,
+    )
+    from database.database import DBConnection
+
+    deadline = time.monotonic() + timeout
+    mail_l = (mail or "").lower().strip()
+    since_cutoff = None
+    if since is not None:
+        since_cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(since - 2))
+
+    while time.monotonic() < deadline:
+        with DBConnection() as db:
+            if since_cutoff:
+                rows = db.cursor.execute(
+                    """
+                    SELECT id, body, subject FROM `received_emails`
+                    WHERE lower(to_address) = ? AND consumed = 0
+                      AND received_at >= ?
+                    ORDER BY id DESC
+                    LIMIT 8
+                    """,
+                    (mail_l, since_cutoff),
+                ).fetchall()
+            else:
+                rows = db.cursor.execute(
+                    """
+                    SELECT id, body, subject FROM `received_emails`
+                    WHERE lower(to_address) = ? AND consumed = 0
+                    ORDER BY id DESC
+                    LIMIT 8
+                    """,
+                    (mail_l,),
+                ).fetchall()
+
+        for email_id, body, subject in rows:
+            if _is_skippable_notification(subject, body or ""):
+                with DBConnection() as db:
+                    db.mark_used(email_id)
+                continue
+            code = _extract_otp(body or "")
+            if code:
+                with DBConnection() as db:
+                    db.mark_used(email_id)
+                return code
+            if body and len(body) > 40:
+                with DBConnection() as db:
+                    db.mark_used(email_id)
+
+        time.sleep(0.8)
+    return None
+
+
+def _find_security_email_proof(
+    proofs: list | None, security_email: str
+) -> dict | None:
+    """Pick the oProofList Email proof that matches our security email."""
+    email = (security_email or "").strip().lower()
+    if not email or "@" not in email:
+        return None
+    local, _, domain = email.partition("@")
+    email_proofs: list[dict] = []
+    for p in proofs or []:
+        if not isinstance(p, dict):
+            continue
+        channel = str(p.get("channel") or "").lower()
+        ptype = str(p.get("type") or "").lower()
+        if channel != "email" and ptype != "email":
+            continue
+        if not p.get("epid"):
+            continue
+        email_proofs.append(p)
+
+    if not email_proofs:
+        return None
+
+    ranked: list[tuple[int, dict]] = []
+    for p in email_proofs:
+        name = str(p.get("name") or p.get("display") or "").lower()
+        clear = str(p.get("clearDigits") or "").lower()
+        score = 0
+        if domain and domain in name:
+            score += 10
+        if clear and local.startswith(clear):
+            score += 50
+        if local[:2] and name.startswith(local[:2]):
+            score += 20
+        if email in name:
+            score += 100
+        ranked.append((score, p))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    best_score, best = ranked[0]
+    if best_score <= 0 and len(email_proofs) > 1:
+        logging.warning(
+            "Ambiguous oProofList email proofs (%s) for %s — using first",
+            len(email_proofs),
+            email,
+        )
+    return best
+
+
+def _reset_password_otp_cloudscraper_sync(
+    email: str,
+    security_email: str,
+    new_password: str,
+) -> bool:
+    """Set password via security-email OTP on ResetPassword.aspx (HAR path).
+
+    Flow (from passwordchange.har / reset-password fabric):
+      1. GET ResetPassword.aspx → sRecoveryToken (v:) + oProofList.epid
+      2. POST /api/Proofs/SendOtt  (associationType=Proof, purpose=RecoverUser)
+      3. Read OTP from security email
+      4. POST /API/Proofs/VerifyCode (action=OTC) → Authz token (a:)
+      5. POST /API/CheckIfBannedPassword
+      6. POST /API/Recovery/ResetPassword with a: token + epid + password
+
+    This is the reliable fallback when RecoverUser returns a new RC but the
+    password field was ignored, and when authenticated ChangePassword 500s.
+    """
+    import time
+    from urllib.parse import quote_plus, unquote as _unquote
+
+    import cloudscraper
+
+    email = (email or "").strip()
+    security_email = (security_email or "").strip()
+    new_password = (new_password or "").strip()
+    if not email or not security_email or not new_password:
+        return False
+
+    reset_url = (
+        "https://account.live.com/ResetPassword.aspx"
+        f"?wreply=https://login.live.com/oauth20_authorize.srf&mn={quote_plus(email)}"
+    )
+
+    client = cloudscraper.create_scraper()
+    client.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+    )
+
+    server_data = None
+    last_body = ""
+    for attempt in range(3):
+        resp = client.get(reset_url)
+        last_body = resp.text or ""
+        _raise_if_account_missing(last_body)
+        server_data = _extract_server_data(last_body)
+        _raise_if_account_missing(last_body, server_data)
+        if server_data and server_data.get("sRecoveryToken") and server_data.get("apiCanary"):
+            break
+        time.sleep(1)
+
+    if not server_data or not server_data.get("sRecoveryToken") or not server_data.get("apiCanary"):
+        logging.error("otp-reset: missing ServerData/tokens for %s", email)
+        return False
+
+    api_canary = server_data["apiCanary"]
+    uaid = server_data.get("sUnauthSessionID", "")
+    uiflvr = int(server_data.get("iUiFlavor") or RECOVER_UIFLVR)
+    scid = int(server_data.get("iScenarioId") or RECOVER_SCID)
+    page_token = _unquote(server_data["sRecoveryToken"])
+
+    proof = _find_security_email_proof(server_data.get("oProofList"), security_email)
+    if not proof:
+        logging.error(
+            "otp-reset: no matching Email proof for %s on %s (proofs=%s)",
+            security_email,
+            email,
+            [
+                {
+                    "name": (p or {}).get("name"),
+                    "type": (p or {}).get("type"),
+                    "channel": (p or {}).get("channel"),
+                }
+                for p in (server_data.get("oProofList") or [])[:6]
+                if isinstance(p, dict)
+            ],
+        )
+        print("[X] - OTP ResetPassword: security email not in oProofList")
+        return False
+
+    epid = str(proof["epid"])
+    requires_reentry = int(proof.get("requiresReentry") or 1)
+    print(
+        f"[~] - OTP ResetPassword via security email "
+        f"({proof.get('name') or security_email})"
+    )
+
+    def _api_headers(canary: str) -> dict:
+        return {
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+            "Origin": "https://account.live.com",
+            "Referer": reset_url,
+            "canary": canary,
+            "Canary": canary,
+            "hpgid": "200284",
+            "hpgact": "0",
+        }
+
+    send_payload = {
+        "associationType": "Proof",
+        "confirmProof": security_email,
+        "epid": epid,
+        "proofRequiredReentry": requires_reentry,
+        "purpose": "RecoverUser",
+        "scid": scid,
+        "token": page_token,
+        "uaid": uaid,
+        "uiflvr": uiflvr,
+    }
+
+    ott_before = time.time()
+    send_resp = client.post(
+        "https://account.live.com/api/Proofs/SendOtt",
+        json=send_payload,
+        headers=_api_headers(api_canary),
+    )
+    try:
+        send_json = send_resp.json()
+    except Exception:
+        logging.error("otp-reset SendOtt non-JSON: %s", (send_resp.text or "")[:300])
+        return False
+
+    if not isinstance(send_json, dict) or (
+        send_json.get("error") and not send_json.get("apiCanary")
+    ):
+        logging.error("otp-reset SendOtt failed: %s", send_json)
+        print(f"[X] - OTP ResetPassword SendOtt error: {(send_json or {}).get('error')}")
+        return False
+
+    if isinstance(send_json.get("apiCanary"), str) and send_json["apiCanary"]:
+        api_canary = send_json["apiCanary"]
+
+    # Sync DB poll (worker thread — no nested asyncio loop).
+    otp = _poll_email_otp_sync(security_email, timeout=90, since=ott_before)
+    if not otp:
+        print("[X] - OTP ResetPassword: no security-email code arrived")
+        return False
+    print(f"[+] - OTP ResetPassword got code ({otp})")
+
+    verify_payload = {
+        "action": "OTC",
+        "confirmProof": security_email,
+        "epid": epid,
+        "proofRequiredReentry": requires_reentry,
+        "purpose": "RecoverUser",
+        "scid": scid,
+        "token": page_token,
+        "uaid": uaid,
+        "uiflvr": uiflvr,
+        "code": otp,
+    }
+    verify_resp = client.post(
+        "https://account.live.com/API/Proofs/VerifyCode",
+        json=verify_payload,
+        headers=_api_headers(api_canary),
+    )
+    try:
+        verify_json = verify_resp.json()
+    except Exception:
+        logging.error("otp-reset VerifyCode non-JSON: %s", (verify_resp.text or "")[:300])
+        return False
+
+    authz_token = verify_json.get("token") if isinstance(verify_json, dict) else None
+    if not authz_token or _token_type(authz_token) not in ("Authz", "Recover", "Reset"):
+        err = (verify_json or {}).get("error") if isinstance(verify_json, dict) else None
+        logging.error("otp-reset VerifyCode bad token: %s", verify_json)
+        print(f"[X] - OTP ResetPassword VerifyCode failed: {err}")
+        return False
+
+    if isinstance(verify_json.get("apiCanary"), str) and verify_json["apiCanary"]:
+        api_canary = verify_json["apiCanary"]
+
+    print(
+        f"[+] - OTP VerifyCode OK token type={_token_type(authz_token)} "
+        f"(len={len(authz_token)})"
+    )
+
+    try:
+        ban = client.post(
+            "https://account.live.com/API/CheckIfBannedPassword",
+            json={
+                "scid": scid,
+                "uaid": uaid,
+                "uiflvr": uiflvr,
+                "password": new_password,
+            },
+            headers=_api_headers(api_canary),
+        ).json()
+        if isinstance(ban, dict) and ban.get("isBanned"):
+            print("[X] - OTP ResetPassword: password banned by Microsoft")
+            return False
+        if isinstance(ban, dict) and isinstance(ban.get("apiCanary"), str) and ban["apiCanary"]:
+            api_canary = ban["apiCanary"]
+    except Exception:
+        logging.exception("otp-reset CheckIfBannedPassword soft-skip")
+
+    # Official fabric _S / HAR: use a: token from VerifyCode (NOT v: page token).
+    reset_payload = {
+        "epid": epid,
+        "expiryEnabled": False,
+        "scid": scid,
+        "signinName": "",
+        "token": authz_token,
+        "uaid": uaid,
+        "uiflvr": uiflvr,
+        "password": new_password,
+    }
+    reset_resp = client.post(
+        "https://account.live.com/API/Recovery/ResetPassword",
+        json=reset_payload,
+        headers=_api_headers(api_canary),
+    )
+    try:
+        reset_json = reset_resp.json() if (reset_resp.text or "").strip() else {}
+    except Exception:
+        logging.error("otp-reset ResetPassword non-JSON: %s", (reset_resp.text or "")[:300])
+        return False
+
+    err = reset_json.get("error") if isinstance(reset_json, dict) else None
+    if err:
+        code = err.get("code") if isinstance(err, dict) else err
+        logging.error("otp-reset ResetPassword error=%s body=%s", code, reset_json)
+        print(f"[X] - OTP ResetPassword API error: {code}")
+        return False
+
+    logging.info("otp-reset ResetPassword OK keys=%s", list(reset_json)[:8] if isinstance(reset_json, dict) else None)
+    print("[+] - OTP ResetPassword OK (security-email OTC)")
+    return True
+
+
+async def reset_password_via_security_email_otp(
+    email: str,
+    security_email: str,
+    new_password: str,
+) -> bool:
+    """Async wrapper — cloudscraper/direct (same transport as RecoverUser)."""
+    try:
+        print("[~] ResetPassword via security-email OTP (HAR / fabric path)")
+        ok = await asyncio.to_thread(
+            _reset_password_otp_cloudscraper_sync,
+            email,
+            security_email,
+            new_password,
+        )
+        return bool(ok)
+    except RecoverError:
+        raise
+    except Exception:
+        logging.exception("reset_password_via_security_email_otp crashed for %s", email)
+        return False
