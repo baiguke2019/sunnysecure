@@ -166,9 +166,9 @@ async def _fetch_entitlements_once(ssid: str) -> dict[str, Any]:
             )
             return classified
 
-        # Fallback: /entitlements/mcstore — names only (no source).
-        # Wiki: Game Pass users typically do NOT get game_minecraft here;
-        # presence of game_minecraft/product_minecraft ⇒ real ownership.
+        # /entitlements/mcstore lists names only — Game Pass accounts ALSO get
+        # game_minecraft here, so it cannot distinguish PURCHASE vs GAMEPASS.
+        # Only use it to confirm "has some MC access" when license had no source.
         mcstore_json = await _get_json(
             session, MCSTORE_URL, headers=headers, label="entitlements/mcstore",
         )
@@ -176,30 +176,37 @@ async def _fetch_entitlements_once(ssid: str) -> dict[str, Any]:
         names = {str(i.get("name") or "").lower() for i in mcstore_items}
         has_game = "game_minecraft" in names or "product_minecraft" in names
 
-        if has_game:
+        if license_items:
+            # License returned items but no usable source on game/product_minecraft
             result = {
-                "method": "Purchased",
-                "game_minecraft_source": "PURCHASE" if "game_minecraft" in names else None,
-                "product_minecraft_source": "PURCHASE" if "product_minecraft" in names else None,
-                "owns_minecraft": True,
-                "items_summary": sorted(names),
-                "item_count": len(mcstore_items),
-                "endpoint": "mcstore",
-                "note": "inferred PURCHASE from mcstore ownership items",
+                **classified,
+                "owns_minecraft": bool(classified.get("owns_minecraft") or has_game),
+                "endpoint": "license",
+                "request_id": request_id,
+                "note": "license items present but no PURCHASE/GAMEPASS source on game_minecraft",
             }
-            log.info("entitlements/mcstore → Purchased (inferred) names=%s", sorted(names))
+            log.warning(
+                "entitlements/license: items=%s but no classifiable game_minecraft source",
+                classified.get("items_summary"),
+            )
             return result
 
         result = {
             "method": None,
             "game_minecraft_source": None,
             "product_minecraft_source": None,
-            "owns_minecraft": False,
-            "items_summary": classified.get("items_summary") or sorted(names),
-            "item_count": len(license_items) or len(mcstore_items),
-            "endpoint": "license+mcstore",
+            "owns_minecraft": has_game,
+            "items_summary": sorted(names) if names else classified.get("items_summary") or [],
+            "item_count": len(mcstore_items),
+            "endpoint": "mcstore" if mcstore_items else "license+mcstore",
+            "note": (
+                "mcstore has game_minecraft but no source — cannot classify; "
+                "need entitlements/license"
+                if has_game else
+                "no game_minecraft ownership"
+            ),
         }
-        log.info("entitlements → no game_minecraft ownership")
+        log.info("entitlements → %s", result["note"])
         return result
 
 
