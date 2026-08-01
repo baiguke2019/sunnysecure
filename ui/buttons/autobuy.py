@@ -298,11 +298,17 @@ class AutobuyView(discord.ui.View):
         self.add_item(SellMfaButton())
         self.add_item(Sell2faButton())
 
+def _code_box(text: str) -> str:
+    """Single-line dark code block (same visual trick as the Fluffy-style panels)."""
+    return f"```\n{text}\n```"
+
+
 def build_autobuy_embed(
     snapshot: dict | None = None,
     *,
     allow_network: bool = True,
 ) -> discord.Embed:
+    """Selling panel — short how-to + boxed stats (easy to scan)."""
     global _last_snapshot
     cfg = _autobuy_cfg()
     emb = cfg.get("embed") or {}
@@ -314,19 +320,38 @@ def build_autobuy_embed(
     check_h = float(cfg.get("hold_check_interval_hours") or 6)
     lock_second = float(cfg.get("hold_check_second_interval_hours") or (5.0 + 50.0 / 60.0))
     sec_check = float(cfg.get("security_email_check_interval_hours") or 2)
-
-    description = (emb.get("description") or "").format(
-        price=price,
-        max_day=max_day,
-        max_submit=max_submit,
-        pending=pending,
-        client_plus_pending=client_plus_pending,
-        check_hours=check_h,
-        lock_second=round(lock_second, 2),
-        sec_check=sec_check,
+    lock_second_disp = (
+        f"{lock_second:.0f}"
+        if float(lock_second).is_integer()
+        else f"{lock_second:.2f}".rstrip("0").rstrip(".")
     )
 
-    ltc_usd_line = "🏦 **Hot wallet:** unavailable"
+    fmt = {
+        "price": f"{price:.2f}",
+        "max_day": max_day,
+        "max_submit": max_submit,
+        "pending": pending,
+        "client_plus_pending": client_plus_pending,
+        "check_hours": f"{check_h:g}",
+        "lock_second": lock_second_disp,
+        "sec_check": f"{sec_check:g}",
+    }
+
+    default_desc = (
+        "Sell Microsoft accounts (**recovery code** or **2FA**) and get paid in Litecoin.\n\n"
+        "**How it works**\n"
+        "1. 🔗 **Link LTC** — connect your wallet *(one-time)*\n"
+        "2. 🧾 **Sell (Rec code)** or 🔐 **Sell (2FA)** — paste your accounts\n"
+        "3. ⏳ Credits unlock after **{pending}h** · Client+ **{client_plus_pending}h**\n"
+        "4. 💸 **Withdraw** — payout hits your Litecoin wallet"
+    )
+    raw_desc = (emb.get("description") or default_desc).strip()
+    try:
+        description = raw_desc.format(**fmt)
+    except (KeyError, ValueError):
+        description = raw_desc
+
+    wallet_box = "unavailable"
     try:
         if snapshot is None and allow_network:
             from payments.ltc_wallet import get_ltc_wallet
@@ -339,16 +364,39 @@ def build_autobuy_embed(
             _last_snapshot = snapshot
             usd = float(snapshot.get("usd") or 0)
             ltc = float(snapshot.get("ltc") or 0)
-            ltc_usd_line = f"🏦 **Hot wallet:** **${usd:.2f}** · `{ltc:.8f}` LTC"
+            wallet_box = f"${usd:.2f}  •  {ltc:.4f} LTC"
     except Exception:
         logger.exception("build_autobuy_embed balance failed")
 
-    description = f"{description}\n\n{ltc_usd_line}"
-
     embed = discord.Embed(
-        title=emb.get("title") or "💰 Sell Your Accounts",
+        title=emb.get("title") or "🪙 Autobuy — Sell for Litecoin",
         description=description,
         color=int(emb.get("color") or 0x57F287),
     )
-    embed.set_footer(text=emb.get("footer") or "Fast · Secure · Paid in LTC")
+
+    # Boxed stats (full-width) — rate / wallet / caps
+    embed.add_field(
+        name="💵 Rate",
+        value=_code_box(f"${price:.2f} / MFA"),
+        inline=False,
+    )
+    embed.add_field(
+        name="🏦 Wallet Balance",
+        value=_code_box(wallet_box),
+        inline=False,
+    )
+    embed.add_field(
+        name="📦 Limits",
+        value=_code_box(f"{max_submit} / submit  •  {max_day} / day"),
+        inline=False,
+    )
+
+    thumb = emb.get("thumbnail") or emb.get("thumbnail_url")
+    if thumb:
+        embed.set_thumbnail(url=str(thumb))
+
+    embed.set_footer(
+        text=emb.get("footer")
+        or "LTC payouts • link wallet once • withdraw anytime"
+    )
     return embed
