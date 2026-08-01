@@ -405,9 +405,18 @@ def rejection_reason(account_info: dict | None, *, cfg: dict | None = None) -> s
         if replaced is False:
             old = str(ms.get("original_email") or "").strip() or "original"
             kept = str(ms.get("email") or "").strip() or "unknown"
+            # When replace fails, kept == submitted (login never switched to sunny@).
+            # Wording used to look like a no-op bug ("still X; submitted X").
+            if kept.lower() == old.lower():
+                return (
+                    "Failed to replace primary email after retries — "
+                    f"login is still the original address ({kept}). "
+                    "Password/security email may already be changed; "
+                    "account returned (no payout)."
+                )
             return (
                 f"Failed to replace primary email after retries "
-                f"(still {kept}; submitted {old})."
+                f"(login={kept}; submitted={old})."
             )
 
     # HasPhone GetCredentialType flag is nearly always 1 (even with no SMS proof).

