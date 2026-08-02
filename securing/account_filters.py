@@ -30,6 +30,8 @@ def _load_reject_cfg() -> dict:
             # actually scraped an SMS/phone proof row on proofs/Manage.
             "require_no_phone": reject.get("require_no_phone", False),
             "require_no_sms_proof": reject.get("require_no_sms_proof", True),
+            # NFA / gen farm Minecraft name brands (autobuy return)
+            "nfa_name_patterns": reject.get("nfa_name_patterns", True),
         }
     except Exception:
         return {
@@ -41,7 +43,54 @@ def _load_reject_cfg() -> dict:
             "require_primary_alias": True,
             "require_no_phone": False,
             "require_no_sms_proof": True,
+            "nfa_name_patterns": True,
         }
+
+
+# Minecraft IGN patterns seen on mass-banned NFA / generator farms.
+# Keep this brand/prefix-based — avoid entropy heuristics (false positives).
+_NFA_NAME_REASONS = "we do not allow or buy accounts from nfa"
+_NFA_NAME_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # AltVerse_uge_AV / AltVerseylpAV / AltVersep94AV
+    re.compile(r"(?i)^altverse"),
+    # Ask_JaBOP_05_03 / aks_gBFOM_02_22  (prefix + junk + _MM_DD)
+    re.compile(r"(?i)^(ask|aks)_[a-z0-9]+_\d{2}_\d{2}$"),
+    # Skycron_zYumG_05
+    re.compile(r"(?i)^skycron[_-]?"),
+    # mogalts_6l8r2
+    re.compile(r"(?i)^mogalts[_-]?"),
+    # Sv2UMl665K030Sv2 / FlareCdV3SUE8Sv2  (Sv2 generator brand)
+    re.compile(r"(?i)sv2"),
+)
+
+# PASIRbsznj7dajyg — ALLCAPS run (4+) then lowercase gibberish + digit, no _
+# Min length 12 to avoid short false positives.
+_NFA_CAPS_GIBBERISH_RE = re.compile(r"^[A-Z]{4,}[a-z]+\d[a-z0-9]*$")
+
+
+def _clean_mc_name(raw: Any) -> str:
+    """Strip status annotations from minecraft.name for pattern matching."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    # "Name (No Java)" / "Name (MC check failed)" / child-lock markers
+    text = re.sub(r"\s*\([^)]*\)\s*$", "", text).strip()
+    low = text.lower()
+    if low in ("no minecraft", "unknown", "n/a", "none", ""):
+        return ""
+    if "child locked" in low or "mc check failed" in low:
+        return ""
+    return text
+
+
+def is_nfa_minecraft_name(name: Any) -> bool:
+    """True if the Minecraft IGN matches known NFA / gen-farm naming brands."""
+    cleaned = _clean_mc_name(name)
+    if not cleaned:
+        return False
+    if any(p.search(cleaned) for p in _NFA_NAME_PATTERNS):
+        return True
+    return len(cleaned) >= 12 and bool(_NFA_CAPS_GIBBERISH_RE.fullmatch(cleaned))
 
 
 def _parse_birthday(raw: Any) -> date | None:
@@ -341,6 +390,16 @@ def rejection_reason(account_info: dict | None, *, cfg: dict | None = None) -> s
     rules = cfg or _load_reject_cfg()
     ms = account_info.get("microsoft") or {}
     mc = account_info.get("minecraft") or {}
+
+    # NFA / generator-farm IGN brands (autobuy return — no payout)
+    if rules.get("nfa_name_patterns", True):
+        for candidate in (
+            mc.get("name"),
+            mc.get("gamertag"),
+            mc.get("username"),
+        ):
+            if is_nfa_minecraft_name(candidate):
+                return _NFA_NAME_REASONS
 
     # Family Locked / child lock markers from login interrupt
     if rules.get("family_locked", True):
