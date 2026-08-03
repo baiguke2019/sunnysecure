@@ -4,6 +4,7 @@
     "real": {
       "accounts": false,
       "addcredits": true,
+      "removecredit": true,
       "auth_code": true,
       "autobuy": true,
       "check_lock": true,
@@ -24,6 +25,7 @@
     "aliases": {
       "auth_code": "auth_code",
       "addcredits": "addcredits",
+      "removecredit": "removecredit",
       "autobuy": "autobuy",
       "check_lock": "check",
       "checkbalance": "checkbalance",

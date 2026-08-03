@@ -614,6 +614,33 @@ class DBConnection:
         self.conn.commit()
         return int(self.cursor.lastrowid)
 
+    def autobuy_remove_manual_credit(
+        self,
+        discord_id: int,
+        amount_usd: float,
+        *,
+        note: str | None = None,
+        removed_by: int | None = None,
+    ) -> int:
+        """Owner debit — subtract from available balance (may go negative)."""
+        amount = round(float(amount_usd), 8)
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        debit = -amount
+        label = (note or "manual_remove").strip()[:200] or "manual_remove"
+        if removed_by:
+            email = f"manual_remove:{removed_by}:{label}"
+        else:
+            email = f"manual_remove:{label}"
+        self.cursor.execute("""
+            INSERT INTO autobuy_credits
+                (discord_id, amount_usd, remaining_usd, available_at, source, email,
+                 status, next_check_at, next_lock_check_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'manual_remove', ?, 'cleared', NULL, NULL)
+        """, (discord_id, debit, debit, email[:240]))
+        self.conn.commit()
+        return int(self.cursor.lastrowid)
+
     def autobuy_record_sell(
         self,
         discord_id: int,
@@ -700,10 +727,10 @@ class DBConnection:
               AND COALESCE(status, 'holding') = 'holding'
         """, (discord_id,)).fetchone()[0]
         # available = passed hold checks and cleared for withdraw
+        # Include negative remaining (admin /removecredit debits) so balance can go < 0.
         available = self.cursor.execute("""
             SELECT COALESCE(SUM(remaining_usd), 0) FROM autobuy_credits
             WHERE discord_id = ?
-              AND remaining_usd > 0
               AND status = 'cleared'
         """, (discord_id,)).fetchone()[0]
         voided = self.cursor.execute("""
