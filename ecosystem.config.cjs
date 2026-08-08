@@ -8,7 +8,7 @@ module.exports = {
       env: {
         // API stays localhost-only; Nitro proxies /api from the public UI
         CORS_ORIGINS:
-          "http://127.0.0.1:3000,http://localhost:3000,http://208.84.101.140:3000",
+          "http://127.0.0.1:3000,http://localhost:3000",
       },
       autorestart: true,
       max_restarts: 10,

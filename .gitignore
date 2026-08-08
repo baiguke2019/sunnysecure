@@ -266,6 +266,10 @@ forensics/
 activity_*.html
 activity_*.json
 
+# One-off local scripts (historically contained live MSA emails/passwords/RCs)
+scripts/**
+!scripts/README.md
+
 # Crypto wallets / keys
 *.wif
 *.pem
