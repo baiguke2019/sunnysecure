@@ -7,12 +7,33 @@ WEB="$ROOT/web"
 cd "$ROOT"
 
 if [[ ! -f config/config.json ]]; then
-  echo "Missing config/config.json — copy from README and fill in your values."
+  if [[ -f config/config.json.example ]]; then
+    cp config/config.json.example config/config.json
+    echo "[*] Created config/config.json from config.json.example"
+    echo "    Edit it now: bot token, owners, domain, web password, mail webhooks."
+    echo "    Then re-run ./setup.sh"
+    exit 1
+  fi
+  echo "Missing config/config.json and config/config.json.example"
   exit 1
 fi
 
+if [[ ! -f config/bot.json && -f config/bot.json.example ]]; then
+  cp config/bot.json.example config/bot.json
+  echo "[*] Created config/bot.json from bot.json.example"
+fi
+
+# Prefer python3.12+, fall back to python3
+PY="${PYTHON:-}"
+if [[ -z "$PY" ]]; then
+  if command -v python3.12 >/dev/null 2>&1; then PY=python3.12
+  elif command -v python3.14 >/dev/null 2>&1; then PY=python3.14
+  else PY=python3
+  fi
+fi
+
 if [[ ! -d .venv ]]; then
-  python3.14 -m venv .venv
+  "$PY" -m venv .venv
   .venv/bin/pip install -r requirements.txt
 fi
 

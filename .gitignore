@@ -219,8 +219,11 @@ config/config.json
 /config.json
 *.local.json
 !config/config.json.example
+!config/bot.json.example
 !config/*.example.json
 !config/*.json.example
+!cloudflared.yml.example
+!ecosystem.config.cjs.example
 
 # Env files (all variants)
 .env

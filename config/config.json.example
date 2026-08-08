@@ -26,7 +26,8 @@
       "check_hypixel_ban": false,
       "check_donutsmp_ban": true,
       "require_no_phone": false,
-      "require_no_sms_proof": true
+      "require_no_sms_proof": true,
+      "nfa_name_patterns": true
     }
   },
   "coldproxy": {
@@ -53,7 +54,10 @@
   "mail": {
     "discord_webhook_all": "",
     "discord_webhook_otp": "",
-    "otp_bridge_url": "",
+    "otp_bridge_urls": [
+      "http://127.0.0.1:12798/otp"
+    ],
+    "otp_bridge_url": "http://127.0.0.1:12798/otp",
     "otp_bridge_token": ""
   },
   "autobuy": {
@@ -69,10 +73,11 @@
     "hold_check_enabled": true,
     "min_withdraw_usd": 1.0,
     "seller_role_id": "",
+    "guild_id": "",
     "ltc_usd_rate": null,
     "embed": {
       "title": "Sell Your Accounts",
-      "description": "Sell MFA accounts for Litecoin.\n\n**${price} per MFA**\nCredits unlock after **{pending}h** \u00b7 Client+ **{client_plus_pending}h**\nSecurity-email check every **{sec_check}h** \u00b7 lock check every **{check_hours}h**",
+      "description": "Sell MFA accounts for Litecoin.\n\n**${price} per MFA**\nCredits unlock after **{pending}h** · Client+ **{client_plus_pending}h**\nSecurity-email check every **{sec_check}h** · lock check every **{check_hours}h**",
       "color": 5763719,
       "footer": "Paid in LTC"
     },

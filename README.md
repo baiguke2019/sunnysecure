@@ -39,8 +39,9 @@ Upstream Discord invite and original docs are not affiliated with this fork.
 ## Table of contents
 
 - [Requirements](#requirements)
-- [Quick setup](#quick-setup)
-- [Configuration](#configuration)
+- [Setup (step by step)](#setup-step-by-step)
+- [Example config files](#example-config-files)
+- [Configuration reference](#configuration-reference)
 - [Email & DNS](#email--dns)
 - [Running with PM2](#running-with-pm2)
 - [Web dashboard](#web-dashboard)
@@ -56,52 +57,133 @@ Upstream Discord invite and original docs are not affiliated with this fork.
 |------------|---------|---------|
 | Python | 3.12+ | Bot, API, securing logic, SMTP |
 | Node.js | 20+ (22 recommended for web build) | Dashboard frontend |
-| PM2 | latest | Process manager |
-| Port 25 | open | Inbound SMTP for security emails |
+| PM2 | latest | Process manager (`npm i -g pm2`) |
+| Port 25 | open (inbound) | SMTP for security emails |
+| Domain + DNS | MX + A for mail | Deliver Microsoft OTPs to your host |
 
 ---
 
-## Quick setup
+## Setup (step by step)
+
+### 1. Clone
 
 ```bash
-git clone https://github.com/waitno01/autosecure.git
-cd autosecure
+git clone https://github.com/waitno01/sunnysecure.git
+cd sunnysecure   # or autosecure — folder name from clone
+```
 
-# Create config from the example (never commit your real config.json)
+### 2. Create configs from examples
+
+```bash
 cp config/config.json.example config/config.json
-# Edit config/config.json — set bot token, domain, web password, etc.
+cp config/bot.json.example config/bot.json          # if missing
+cp cloudflared.yml.example cloudflared.yml         # optional tunnel
+cp ecosystem.config.cjs.example ecosystem.config.cjs  # optional; repo may already ship one
+```
 
-# Python deps (3.12+)
-python3.12 -m venv .venv
+**Never commit** `config/config.json` (gitignored). It holds the bot token, webhooks, proxies, and wallet keys.
+
+### 3. Discord bot
+
+1. Open [Discord Developer Portal](https://discord.com/developers/applications) → **New Application** → **Bot**
+2. Enable **all Privileged Gateway Intents**
+3. OAuth2 → URL Generator: scopes `bot` + `applications.commands` → invite to your server
+4. Copy the bot token into `config/config.json` → `tokens.bot_token`
+5. Put your Discord user ID in `owners` (Developer Mode → Copy User ID)
+
+### 4. Fill `config/config.json` (minimum)
+
+| Field | What to set |
+|-------|-------------|
+| `owners` | Your Discord snowflake ID(s) |
+| `tokens.bot_token` | Discord bot token |
+| `domain` | Domain that receives security mail (must match MX) |
+| `web.credentials.username` | Dashboard login user |
+| `web.credentials.password` | Long random password (not the example placeholder) |
+| `web.credentials.jwt_secret` | Long random string / 64 hex chars |
+| `mail.discord_webhook_all` | Webhook for every inbound mail (optional but useful) |
+| `mail.discord_webhook_otp` | Webhook when an OTP is detected |
+| `discord.*_channel` | Channel IDs for logs / accounts / censored logs |
+
+Optional later: `proxy` / `coldproxy`, Skytools/Donut API keys, autobuy + LTC wallet, OTP bridge URLs.
+
+### 5. DNS for mail (required for securing)
+
+In Cloudflare (or your DNS), **DNS only** (grey cloud) for mail:
+
+| Type | Name | Value |
+|------|------|-------|
+| A | `mail` | Your VPS public IP |
+| MX | `@` | `mail.yourdomain.com` (priority 10) |
+
+Open **TCP 25** inbound on the VPS firewall. Only one process should listen on port 25 (`autosecure-bot`).
+
+### 6. Install & build
+
+```bash
+# Python
+python3.12 -m venv .venv          # or python3
 .venv/bin/pip install -r requirements.txt
 
 # Web dashboard
 cd web && npm install && npm run build && cd ..
-
-# Start everything
-pm2 start ecosystem.config.cjs
-pm2 save
 ```
 
-Or use the helper script (edit Python version in `setup.sh` if your VPS does not have 3.14):
+Or one-shot (creates `config.json` from the example if missing, then exits so you can edit it):
 
 ```bash
+chmod +x setup.sh
 ./setup.sh
+# edit config/config.json, then run ./setup.sh again
 ```
+
+### 7. Start with PM2
+
+```bash
+pm2 start ecosystem.config.cjs
+pm2 save
+pm2 status
+pm2 logs autosecure-bot
+```
+
+| Process | Port | Role |
+|---------|------|------|
+| `autosecure-bot` | 25 (SMTP) | Discord bot + mail |
+| `autosecure-api` | 8000 (localhost) | FastAPI |
+| `autosecure-web` | 3000 | Dashboard UI |
+
+Dashboard: `http://YOUR_VPS_IP:3000` — log in with `web.credentials`.
+
+### 8. Optional public HTTPS (Cloudflare Tunnel)
+
+```bash
+cp cloudflared.yml.example cloudflared.yml
+# set tunnel id, credentials-file, hostname
+cloudflared tunnel --config cloudflared.yml run
+```
+
+Update `CORS_ORIGINS` in `ecosystem.config.cjs` to include your public UI origin.
 
 ---
 
-## Configuration
+## Example config files
 
-Two config files control runtime behavior. **`config/config.json` is gitignored** — create it locally and keep secrets out of git.
+Shipped templates (safe to commit — placeholders only):
 
-### `config/config.json`
+| File | Purpose |
+|------|---------|
+| [`config/config.json.example`](config/config.json.example) | Secrets + runtime settings → copy to `config/config.json` |
+| [`config/bot.json.example`](config/bot.json.example) | Commands, embeds, presence → copy to `config/bot.json` if needed |
+| [`cloudflared.yml.example`](cloudflared.yml.example) | Cloudflare Tunnel ingress |
+| [`ecosystem.config.cjs.example`](ecosystem.config.cjs.example) | PM2 apps (bot / API / web) |
+
+Minimal `config/config.json` shape:
 
 ```json
 {
   "owners": [ YOUR_DISCORD_ID ],
   "tokens": {
-    "bot_token": "YOUR_BOT_TOKEN",
+    "bot_token": "YOUR_DISCORD_BOT_TOKEN",
     "skytools_key": "",
     "donut_key": ""
   },
@@ -112,8 +194,18 @@ Two config files control runtime behavior. **`config/config.json` is gitignored*
   },
   "autosecure": {
     "replace_main_alias": true,
-    "enable_2fa": true,
-    "minecon_mode": false
+    "enable_2fa": false,
+    "minecon_mode": false,
+    "reject": {
+      "family_locked": true,
+      "gamepass": true,
+      "underage": true,
+      "min_age_years": 18,
+      "require_primary_alias": true,
+      "check_donutsmp_ban": true,
+      "require_no_sms_proof": true,
+      "nfa_name_patterns": true
+    }
   },
   "web": {
     "credentials": {
@@ -123,50 +215,48 @@ Two config files control runtime behavior. **`config/config.json` is gitignored*
     }
   },
   "domain": "yourdomain.com",
+  "proxy": { "enabled": false, "proxies": [] },
   "mail": {
-    "discord_webhook_all": "https://discord.com/api/webhooks/...",
-    "discord_webhook_otp": "https://discord.com/api/webhooks/...",
-    "otp_bridge_url": "http://127.0.0.1:12798/otp",
+    "discord_webhook_all": "",
+    "discord_webhook_otp": "",
+    "otp_bridge_url": "",
     "otp_bridge_token": ""
   },
   "autobuy": {
     "price_per_mfa": 5.0,
     "pending_hours": 12,
-    "client_plus_role_id": "",
-    "client_plus_pending_hours": 3,
-    "security_email_check_interval_hours": 2,
-    "hold_check_interval_hours": 6,
-    "hold_check_second_interval_hours": 5.833333,
     "hold_check_enabled": true
   }
 }
 ```
+
+Full keys (proxy formats, autobuy LTC wallet, reject filters, OTP bridge list) are in **`config/config.json.example`**.
+
+---
+
+## Configuration reference
 
 | Key | Description |
 |-----|-------------|
 | `domain` | Domain for auto-created security emails (`alias@yourdomain.com`) |
 | `mail.discord_webhook_all` | Discord webhook for every incoming email |
 | `mail.discord_webhook_otp` | Discord webhook when an OTP is detected |
-| `mail.otp_bridge_url` | Optional HTTP endpoint (e.g. playtime OTP bridge) |
+| `mail.otp_bridge_url` / `otp_bridge_urls` | Optional HTTP OTP bridge (e.g. playtime / treefarm) |
 | `web.credentials` | Dashboard login + JWT secret |
-| `autosecure.*` | Alias replacement, 2FA, minecon mode, reject filters |
-| `autosecure.reject.gamepass` | Reject accounts with **active** Game Pass only |
+| `proxy.proxies` | List of `host:port:user:pass` (or disable with `enabled: false`) |
+| `coldproxy.*` | Optional Coldproxy residential package |
+| `autosecure.reject.*` | Family / Game Pass / age / ban / phone / NFA-name filters |
+| `autosecure.reject.gamepass` | Rejects **active** Game Pass only |
 | `autobuy.pending_hours` | Default seller credit hold (hours) |
 | `autobuy.client_plus_*` | Shorter hold for Client+ Discord role |
-| `autobuy.security_email_check_interval_hours` | How often to run validity/pullback during pending grace only (RC then security-email; default 2h) |
-| `autobuy.hold_check_interval_hours` | First Microsoft lock check (hours after sell; default 6) |
-| `autobuy.hold_check_second_interval_hours` | Second lock check delay after the first (default 5.833 ≈ 5h50m) |
+| `autobuy.security_email_check_interval_hours` | Pullback / security-email check during pending grace |
+| `autobuy.hold_check_interval_hours` | First Microsoft lock check after sell |
+| `autobuy.hold_check_second_interval_hours` | Second lock check delay after the first |
+| `autobuy.ltc_wallet` | Litecoin payout wallet (`wif` / `address`) — keep private |
 
 ### `config/bot.json`
 
-Command toggles, aliases, embed templates, button labels, presence, and post-verification behavior. Tracked in git (no secrets).
-
-### Discord bot setup
-
-1. [Discord Developer Portal](https://discord.com/developers/applications) → create app → **Bot**
-2. Enable all **Privileged Gateway Intents**
-3. OAuth2 URL Generator: scopes `bot` + `applications.commands`, invite to your server
-4. Put the bot token in `config/config.json`
+Command toggles, aliases, embed templates, button labels, presence, and post-verification behavior. No secrets. Prefer editing via the dashboard **Bot Config** tab when possible.
 
 ### API keys (optional)
 
@@ -174,7 +264,6 @@ Command toggles, aliases, embed templates, button labels, presence, and post-ver
 |---------|-----|----------|
 | Skytools | [developer.skytools.app](https://developer.skytools.app/) | Hypixel / SkyBlock stats |
 | DonutSMP | [api.donutsmp.net](https://api.donutsmp.net/index.html) | Donut stats |
-
 ---
 
 ## Email & DNS
