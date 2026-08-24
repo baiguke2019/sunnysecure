@@ -1,15 +1,19 @@
 """Add an outlook.com alias and promote it to primary.
 
-HTTP flow aligned with dona-fork (names/manage canary → AddAssocId → MakePrimary):
+HTTP flow (names/manage canary → AddAssocId → MakePrimary → separate RemoveAlias):
 - Canary comes from ``/names/manage``, not the AddAssocId HTML form.
 - AddAssocId uses ``PostOption=NONE`` and treats ``alias=`` in the response
   (body or Location) as success — Microsoft often 302s without a clean HTML ok page.
 - Verify by re-listing aliases on ``/names/manage``.
-- MakePrimary uses ``removeOldPrimary=True`` like the working fork.
+- MakePrimary matches the live names/manage XHR (see makeprimaryandremoveoldalias.har):
+  ``Content-Type: application/x-www-form-urlencoded`` with a raw JSON body,
+  ``emailChecked=false``, ``removeOldPrimary=false``. Old aliases are deleted
+  afterwards via the HTML ``action=RemoveAlias`` form, not in the same API call.
 """
 
 from __future__ import annotations
 
+from html import unescape as html_unescape
 from urllib.parse import unquote
 import asyncio
 import json
@@ -20,23 +24,102 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_CANARY_PATTERNS = (
+_FORM_CANARY_PATTERNS = (
     r'<input[^>]*id="canary"[^>]*name="canary"[^>]*value="([^"]+)"',
     r'<input[^>]*name="canary"[^>]*id="canary"[^>]*value="([^"]+)"',
     r'<input[^>]*name="canary"[^>]*value="([^"]+)"',
     r'id="canary"[^>]*value="([^"]+)"',
     r'name="canary"\s+value="([^"]+)"',
-    r'"apiCanary"\s*:\s*"([^"]+)"',
-    r'"canary"\s*:\s*"([^"]+)"',
 )
+
+_MAKE_PRIMARY_HPGID = "200176"
+_MAKE_PRIMARY_SCID = "100141"
+_MAKE_PRIMARY_UIFLVR = "1001"
+
+
+def _json_unescape(raw: str) -> str:
+    if not raw:
+        return ""
+    try:
+        return json.loads(f'"{raw}"')
+    except Exception:
+        return (
+            raw.replace("\\/", "/")
+            .replace('\\"', '"')
+            .replace("\\u002b", "+")
+            .replace("\\u003d", "=")
+        )
+
+
+def _extract_json_str(html: str, key: str) -> str | None:
+    m = re.search(
+        rf'"{re.escape(key)}"\s*:\s*"((?:\\.|[^"\\])*)"',
+        html or "",
+    )
+    if not m:
+        return None
+    val = _json_unescape(m.group(1)).strip()
+    return val or None
+
+
+def _extract_form_canary(html: str) -> str | None:
+    for pat in _FORM_CANARY_PATTERNS:
+        m = re.search(pat, html or "", re.I)
+        if m:
+            return html_unescape(m.group(1))
+    return None
 
 
 def _extract_canary(html: str) -> str | None:
-    for pat in _CANARY_PATTERNS:
-        m = re.search(pat, html or "", re.I)
-        if m:
-            return m.group(1)
+    """Form canary first (AddAssocId / RemoveAlias), then apiCanary."""
+    return (
+        _extract_form_canary(html)
+        or _extract_json_str(html, "apiCanary")
+        or _extract_json_str(html, "canary")
+    )
+
+
+def _tokens_from_html(html: str) -> dict[str, str | None]:
+    """apiCanary / tcxt / uaid from names/manage $Config (MakePrimary XHR)."""
+    form = _extract_form_canary(html)
+    api = _extract_json_str(html, "apiCanary") or _extract_json_str(html, "canary") or form
+    return {
+        "form_canary": form,
+        "api_canary": api,
+        "tcxt": _extract_json_str(html, "tcxt"),
+        "uaid": _extract_json_str(html, "uaid"),
+    }
+
+
+def _cookie_uaid(session: httpx.AsyncClient) -> str | None:
+    try:
+        raw = session.cookies.get("uaid")
+    except Exception:
+        raw = None
+    if raw and re.fullmatch(r"[0-9a-f]{16,32}", str(raw), re.I):
+        return str(raw)
     return None
+
+
+def _signin_name_from_manage(html: str) -> str | None:
+    """Current primary / membername from names/manage $Config."""
+    for key in ("membername", "MemberName", "sSigninName", "signInName"):
+        val = _extract_json_str(html, key)
+        if val and "@" in val:
+            return val.strip().lower()
+    return None
+
+
+def _has_make_primary_control(html: str, email: str) -> bool:
+    """True if this address still has a Make primary control (still secondary)."""
+    if not html or not email:
+        return False
+    blob = html.replace("\\u002b", "+").replace("\\/", "/")
+    esc = re.escape(email.strip())
+    return bool(
+        re.search(rf"ShowMakePrimary\(\s*['\"]{esc}['\"]", blob, re.I)
+        or re.search(rf"ShowUnverifiedMakePrimary\(\s*['\"]{esc}['\"]", blob, re.I)
+    )
 
 
 def _emails_from_manage(html: str) -> list[str]:
@@ -57,6 +140,24 @@ def _emails_from_manage(html: str) -> list[str]:
             addr = m.group(1).strip().lower()
             if addr not in found and not addr.endswith((".png", ".jpg", ".css", ".js")):
                 found.append(addr)
+    # Primary is shown as membername, NOT idAliasEmail* — missing this made
+    # MakePrimary look successful ("old gone") while the original login stayed primary.
+    member = _signin_name_from_manage(html)
+    if member:
+        found.insert(0, member)
+    # Login/MFA pages mention the username — don't treat that as an alias list.
+    blob = (html or "").lower()
+    if "login.live.com" in blob or 'pageid" content="i5030"' in blob or 'pageid" content="i5600"' in blob:
+        found = [e for e in found if member and e == member]
+        if not found and member:
+            found = [member]
+        out: list[str] = []
+        seen: set[str] = set()
+        for e in found:
+            if e not in seen:
+                seen.add(e)
+                out.append(e)
+        return out
     # de-dupe preserve order
     out: list[str] = []
     seen: set[str] = set()
@@ -366,29 +467,51 @@ async def _confirm_primary_switched(
     new_full: str,
     old_email: str | None,
 ) -> bool:
-    """Ground-truth check after MakePrimary — API often lies / returns opaque errors
-    while ``removeOldPrimary`` already deleted the old Outlook login.
+    """Ground-truth check after MakePrimary.
+
+    Live UI sends ``removeOldPrimary=false``, so the old login still exists.
+    Success is: names/manage reports the new address as the sign-in name, or
+    it is listed without a Make-primary control. Old-login-gone (GCT) is only
+    a fallback for accounts where Microsoft still deleted the previous alias.
     """
     new_l = (new_full or "").strip().lower()
     old_l = (old_email or "").strip().lower()
     if not new_l:
         return False
 
-    # 1) names/manage scrape (may be stale right after promote — still useful)
     try:
         await asyncio.sleep(1.0)
-        _, _, aliases = await _get_manage(session)
+        html, _, aliases = await _get_manage(session)
         aliases_l = {a.strip().lower() for a in aliases}
-        if new_l in aliases_l and old_l and old_l not in aliases_l:
-            print(
-                f"[+] - Primary switch confirmed on manage "
-                f"(has {new_full}, old {old_email} gone)"
-            )
+        member = _signin_name_from_manage(html)
+        page_has_mp = bool(re.search(r"ShowMakePrimary\s*\(", html or "", re.I))
+        if member == new_l:
+            print(f"[+] - Primary switch confirmed (membername={new_full})")
             return True
+        if new_l in aliases_l and page_has_mp and not _has_make_primary_control(html, new_full):
+            # Secondary aliases always have Make primary; primary does not.
+            if old_l and _has_make_primary_control(html, old_email or ""):
+                print(
+                    f"[+] - Primary switch confirmed on manage "
+                    f"({new_full} is primary, old still listed)"
+                )
+                return True
+            if member is None:
+                print(
+                    f"[+] - Primary switch confirmed on manage "
+                    f"({new_full} listed without Make-primary)"
+                )
+                return True
+        logger.info(
+            "manage confirm after MakePrimary: member=%s aliases=%s make_primary_new=%s",
+            member,
+            list(aliases_l)[:8],
+            _has_make_primary_control(html, new_full),
+        )
     except Exception as exc:
         logger.warning("manage confirm after MakePrimary failed: %s", exc)
 
-    # 2) GetCredentialType — authoritative for "account doesn't exist"
+    # Fallback: older accounts may still drop the previous Outlook login.
     if old_l and old_l != new_l:
         old_exists = await _gct_exists(old_l)
         new_exists = await _gct_exists(new_l)
@@ -396,23 +519,11 @@ async def _confirm_primary_switched(
             f"[~] - Primary switch GCT check "
             f"(old {old_l} exists={old_exists}, new {new_l} exists={new_exists})"
         )
-        if old_exists is False and new_exists is True:
-            print(
-                f"[+] - Primary switch confirmed via GetCredentialType "
-                f"(old login removed, {new_full} live)"
-            )
-            return True
-        # Old gone + new unknown still strongly implies success
         if old_exists is False and new_exists is not False:
             print(
                 f"[+] - Primary switch confirmed via GetCredentialType "
                 f"(old login {old_email} no longer exists)"
             )
-            return True
-    else:
-        new_exists = await _gct_exists(new_l)
-        if new_exists is True:
-            print(f"[+] - New primary exists on GCT ({new_full})")
             return True
 
     return False
@@ -422,46 +533,65 @@ async def _make_primary(
     session: httpx.AsyncClient,
     full: str,
     apicanary: str,
+    *,
+    tcxt: str | None = None,
+    uaid: str | None = None,
 ) -> bool:
-    """POST /API/MakePrimary. Opaque error code 500 is treated as success (dona)."""
-    uaid = None
-    try:
-        uaid = session.cookies.get("uaid") or session.cookies.get("MSPPre")
-    except Exception:
-        uaid = None
+    """POST /API/MakePrimary matching the live names/manage XHR.
 
-    payload = {
+    Browser sends ``application/x-www-form-urlencoded`` with a JSON *string*
+    body (not ``application/json``), ``emailChecked=false``,
+    ``removeOldPrimary=false``.
+    """
+    if not (apicanary or "").strip():
+        print(f"[X] - Failed to change primary alias ({full}) — no canary")
+        return False
+
+    uaid = (uaid or _cookie_uaid(session) or "").strip() or None
+
+    payload: dict = {
         "aliasName": full,
-        "emailChecked": True,
-        "removeOldPrimary": True,
-        "uiflvr": 1001,
-        "scid": 100141,
-        "hpgid": 200176,
+        "emailChecked": False,
+        "removeOldPrimary": False,
+        "uiflvr": int(_MAKE_PRIMARY_UIFLVR),
     }
     if uaid:
-        payload["uaid"] = str(uaid)[:64]
+        payload["uaid"] = str(uaid)
+    payload["scid"] = int(_MAKE_PRIMARY_SCID)
+    payload["hpgid"] = int(_MAKE_PRIMARY_HPGID)
 
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "canary": apicanary,
+        "hpgid": _MAKE_PRIMARY_HPGID,
+        "scid": _MAKE_PRIMARY_SCID,
+        "uiflvr": _MAKE_PRIMARY_UIFLVR,
+        "x-ms-apiTransport": "xhr",
+        "x-ms-apiVersion": "2",
+        "Origin": "https://account.live.com",
+        "Referer": "https://account.live.com/names/manage",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+    }
+    if uaid:
+        headers["uaid"] = str(uaid)
+    if tcxt:
+        headers["tcxt"] = tcxt
+
+    body = json.dumps(payload, separators=(",", ":"))
     resp = await session.post(
         "https://account.live.com/API/MakePrimary",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-            "canary": apicanary,
-            "hpgid": "200176",
-            "scid": "100141",
-            "uiflvr": "1001",
-            "Origin": "https://account.live.com",
-            "Referer": "https://account.live.com/names/manage",
-        },
-        content=json.dumps(payload),
+        headers=headers,
+        content=body,
     )
 
     try:
         data = resp.json() if (resp.text or "").strip() else {}
     except json.JSONDecodeError:
-        # Socket hang / empty body after success is common
-        if resp.status_code in (200, 204, 500) or not (resp.text or "").strip():
+        if resp.status_code in (200, 204) or not (resp.text or "").strip():
             print(f"[+] - Changed Primary Alias ({full}) — empty/non-JSON OK")
             return True
         logger.error(
@@ -473,14 +603,34 @@ async def _make_primary(
         print(f"[X] - Failed to change primary alias ({full})")
         return False
 
+    if not isinstance(data, dict):
+        data = {}
+
     if "error" in data:
         err = data.get("error") or {}
-        code = str(err.get("code", ""))
+        code = str(err.get("code", "") if isinstance(err, dict) else err)
+        # Opaque 500 is a dona-fork habit; still treat as tentative success
+        # and let the manage-page confirm decide.
         if code == "500":
-            print(f"[+] - Changed Primary Alias ({full})")
+            print(f"[+] - Changed Primary Alias ({full}) — opaque 500")
             return True
-        logger.error("MakePrimary error for %s: %s", full, err)
+        logger.error(
+            "MakePrimary error for %s status=%s: %s",
+            full,
+            resp.status_code,
+            err,
+        )
         print(f"[X] - Failed to change primary alias ({full}) — {code or err}")
+        return False
+
+    if resp.status_code not in (200, 204):
+        logger.error(
+            "MakePrimary HTTP %s for %s body=%s",
+            resp.status_code,
+            full,
+            (resp.text or "")[:400],
+        )
+        print(f"[X] - Failed to change primary alias ({full}) — HTTP {resp.status_code}")
         return False
 
     print(f"[+] - Changed Primary Alias ({full})")
@@ -615,15 +765,17 @@ async def _elevate_for_names_manage(
         return text, None, _emails_from_manage(text)
 
     print("[~] - names/manage requires SA elevation — completing security-email MFA…")
+    # Do NOT password-first: posting login_pwd on i5600 burns sFT and
+    # GetOneTimeCode then returns State 203. Send security-email OTP first.
     resp = await _complete_i5600_email_otc(
         session,
         text,
         security_email=security_email,
         account_email=account_email,
         password=password,
-        wait_slices=(20.0, 30.0),
+        wait_slices=(40.0, 50.0),
         label="Names MFA",
-        try_password_first=bool(password),
+        try_password_first=False,
     )
     if resp is None:
         print("[X] - Failed to elevate session for names/manage")
@@ -735,26 +887,18 @@ async def change_primary_alias(
                     return False
 
         # MakePrimary often flakes right after AddAssocId MFA (stale canary /
-        # session). Retry promote with a fresh canary before giving up — the
-        # alias is already on the account; inventing a NEW sunny on the outer
-        # loop just hits "try again later".
+        # session). Retry promote with a fresh *names/manage* apiCanary —
+        # password/reset canary is a different page and will 1086 the XHR.
         ok = False
         for promo_try in range(1, 4):
+            tokens: dict[str, str | None] = {}
             try:
-                from securing.utils.cookies.get_cookies import get_cookies
-
-                fresh = await get_cookies(session)
-                if fresh:
-                    apicanary = fresh
-            except Exception:
-                pass
-            # Also pull canary from names/manage (more reliable post-MFA)
-            try:
-                _, manage_canary, on_manage = await _get_manage(session)
-                if manage_canary:
-                    apicanary = manage_canary
+                html_m, manage_canary, on_manage = await _get_manage(session)
+                tokens = _tokens_from_html(html_m)
+                api_canary = tokens.get("api_canary") or manage_canary or apicanary
+                if api_canary:
+                    apicanary = api_canary
                 if full.lower() not in [e.lower() for e in on_manage]:
-                    # Alias vanished — don't keep promoting a ghost
                     if promo_try == 1:
                         print(f"[X] - Alias missing before MakePrimary ({full})")
                     break
@@ -762,10 +906,15 @@ async def change_primary_alias(
                 on_manage = []
 
             print(f"[~] - MakePrimary attempt {promo_try}/3 ({full})")
-            ok = await _make_primary(session, full, apicanary)
+            ok = await _make_primary(
+                session,
+                full,
+                apicanary,
+                tcxt=tokens.get("tcxt"),
+                uaid=tokens.get("uaid") or _cookie_uaid(session),
+            )
             if ok:
                 break
-            # Even on API "failure", MS may have already applied removeOldPrimary.
             if await _confirm_primary_switched(session, full, account_email):
                 return True
             await asyncio.sleep(1.5 * promo_try)

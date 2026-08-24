@@ -625,10 +625,9 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
                         await asyncio.sleep(2.0 * attempt)
 
                 if not changed:
-                    # MakePrimary JSON often lies while removeOldPrimary already
-                    # deleted the old Outlook login. Confirm via GetCredentialType
-                    # before marking replace failed (avoids returning a secured
-                    # sunny* account as "primary unchanged").
+                    # MakePrimary JSON can lie. Confirm via names/manage membername
+                    # (old login still exists — live UI uses removeOldPrimary=false)
+                    # or GCT if Microsoft dropped the previous Outlook login.
                     try:
                         from securing.utils.security.change_primary_alias import (
                             _confirm_primary_switched,

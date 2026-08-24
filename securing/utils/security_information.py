@@ -356,8 +356,9 @@ def _gotc_state_ok(data: dict) -> bool:
             state_i = int(state)
         except (TypeError, ValueError):
             return False
-        # 200/201 = sent; 204/205/etc = not sent
-        return state_i in (200, 201)
+        # 200/201 = sent; 203 = already sent / in-flight (still wait for mail);
+        # 204/205/etc = not sent
+        return state_i in (200, 201, 203)
     # No State field — require a positive success marker
     if data.get("SessionId") or data.get("sessionId"):
         return True
