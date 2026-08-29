@@ -109,7 +109,7 @@ async def send_auth(session: httpx.AsyncClient, email: str, proof: str = None) -
                 print(f"[~] - Switched OTP Type")
                 payload["purpose"] = "eOTT_NoPasswordAccountLoginCode"
 
-            await session.post(
+            gotc = await session.post(
                 url="https://login.live.com/GetOneTimeCode.srf?id=38936",
                 headers={
                     "Accept": "application/json",
@@ -117,6 +117,7 @@ async def send_auth(session: httpx.AsyncClient, email: str, proof: str = None) -
                 },
                 data=payload,
             )
+            print(f"GetOneTimeCode: {gotc.status_code} {(gotc.text or '')[:400]}")
 
             return {
                 "type": "email",

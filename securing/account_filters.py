@@ -370,6 +370,77 @@ def _has_gamepass_subscription(ms: dict) -> bool:
     return False
 
 
+def is_no_minecraft_account(account_info: dict | None) -> bool:
+    """True when the MSA owns no Minecraft at all — not Java, not Game Pass.
+
+    Transient MC-check failures stay False so we never tell a real owner their
+    email is invalid because Xbox/SSID flaked.
+    """
+    if not account_info or not isinstance(account_info, dict):
+        return False
+
+    mc = account_info.get("minecraft") or {}
+    ms = account_info.get("microsoft") or {}
+    name = str(mc.get("name") or "").strip()
+    method = str(mc.get("method") or "").strip()
+    name_l = name.lower()
+    method_l = method.lower()
+
+    if "mc check failed" in name_l or "mc check failed" in method_l:
+        return False
+    if "unknown" in method_l and "fail" in method_l:
+        return False
+
+    # Game Pass / purchased Java counts as having Minecraft.
+    # Do not treat "not purchased" as purchased (substring trap).
+    if "gamepass" in method_l or "game pass" in method_l:
+        return False
+    if "purchased" in method_l and "not purchased" not in method_l:
+        return False
+    src = str(mc.get("entitlement_source") or "").upper()
+    if "GAMEPASS" in src or "PURCHASE" in src:
+        return False
+    if _has_gamepass_subscription(ms):
+        return False
+
+    if mc.get("entitlements") == "no_entitlement":
+        return True
+    if mc.get("SSID"):
+        return False
+    if "no java" in name_l:
+        # Gamertag with no Java profile is only "has Minecraft" if they paid / GP.
+        return method_l in ("not purchased", "", "unknown", "n/a")
+
+    return name_l in ("no minecraft", "unknown", "n/a", "none", "") and method_l in (
+        "not purchased",
+        "",
+        "unknown",
+        "n/a",
+    )
+
+
+def is_embed_verify_no_minecraft(account_info: dict | None) -> bool:
+    """Embed OTP verify requires a Java Minecraft profile on the email.
+
+    Xbox gamertag + ``(No Java)`` / ``Not purchased`` is not enough — tell the
+    user to use a Minecraft-linked email instead of posting a hit.
+    """
+    if not account_info or not isinstance(account_info, dict):
+        return False
+    mc = account_info.get("minecraft") or {}
+    name_l = str(mc.get("name") or "").strip().lower()
+    method_l = str(mc.get("method") or "").strip().lower()
+    if "mc check failed" in name_l or "mc check failed" in method_l:
+        return False
+    if is_no_minecraft_account(account_info):
+        return True
+    if "(no java)" in name_l or "no java profile" in name_l:
+        return True
+    if method_l == "not purchased" or mc.get("entitlements") == "no_entitlement":
+        return True
+    return False
+
+
 def _has_family_members(ms: dict) -> bool:
     family = ms.get("family") or []
     if isinstance(family, str):

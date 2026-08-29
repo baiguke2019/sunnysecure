@@ -91,24 +91,36 @@ class ButtonOptions(ui.View):
         if not self.dstats or self.dstats == "Failed":
             await interaction.followup.send("No DonutSMP stats found.", ephemeral=True)
             return
-        
-        ms = int(float(self.dstats['playtime'])) if self.dstats['playtime'] else 0
+
+        result = self.dstats.get("result") if isinstance(self.dstats, dict) else None
+        if not isinstance(result, dict):
+            result = self.dstats if isinstance(self.dstats, dict) else {}
+
+        raw_pt = result.get("playtime") or result.get("playTime") or 0
+        try:
+            ms = int(float(raw_pt)) if raw_pt else 0
+        except (TypeError, ValueError):
+            ms = 0
         days = ms // 86400000
         hours = (ms % 86400000) // 3600000
+
+        def field(key, default=0):
+            val = result.get(key, default)
+            return 0 if val is None else val
 
         embed = discord.Embed(
             title=f"Donut Stats for {self.username}",
             description=(
-                f"**Money**: `${simplify(self.dstats['money'])}`\n"
-                f"**Shards**: `{simplify(self.dstats['shards'])}`\n"
-                f"**Player Kills**: `{simplify(self.dstats['kills'])}`\n"
-                f"**Deaths**: `{simplify(self.dstats['deaths'])}`\n"
+                f"**Money**: `${simplify(field('money'))}`\n"
+                f"**Shards**: `{simplify(field('shards'))}`\n"
+                f"**Player Kills**: `{simplify(field('kills'))}`\n"
+                f"**Deaths**: `{simplify(field('deaths'))}`\n"
                 f"**Playtime**: `{days}d {hours}h`\n"
-                f"**Blocks Placed**: `{simplify(self.dstats['placed_blocks'])}`\n"
-                f"**Blocks Broken**: `{simplify(self.dstats['broken_blocks'])}`\n"
-                f"**Mobs Killed**: `{simplify(self.dstats['mobs_killed'])}`\n"
-                f"**Money Spent**: `${simplify(self.dstats['money_spent_on_shop'])}`\n"
-                f"**Money Made**: `${simplify(self.dstats['money_made_from_sell'])}`"
+                f"**Blocks Placed**: `{simplify(field('placed_blocks'))}`\n"
+                f"**Blocks Broken**: `{simplify(field('broken_blocks'))}`\n"
+                f"**Mobs Killed**: `{simplify(field('mobs_killed'))}`\n"
+                f"**Money Spent**: `${simplify(field('money_spent_on_shop'))}`\n"
+                f"**Money Made**: `${simplify(field('money_made_from_sell'))}`"
             ),
             timestamp=datetime.utcnow(),
             color=0xFF9E45

@@ -3,7 +3,7 @@ from discord.ext import commands
 from datetime import datetime
 import discord
 
-from minecraft.get_donut import get_donut_stats
+from minecraft.get_donut import get_donut_stats, parse_donut_result
 from minecraft.get_hypixel import get_hypixel_stats
 import json
 
@@ -28,12 +28,11 @@ class Stats(commands.Cog):
         if not donut_stats:
             await ctx.followup.send("Set up your donut API key first!", ephemeral=True)
             return
-        
-        elif donut_stats == "Failed":
+
+        result = parse_donut_result(donut_stats)
+        if not result:
             await ctx.followup.send("That player doesn't have stats!", ephemeral=True)
             return
-
-        result = donut_stats["result"]
         ms = int(float(result['playtime'])) if result['playtime'] else 0
         days = ms // 86400000
         hours = (ms % 86400000) // 3600000

@@ -50,18 +50,24 @@ async def force_password_via_otp(
     email: str,
     security_email: str,
     preferred_password: str | None = None,
+    session: httpx.AsyncClient | None = None,
 ) -> tuple[str, bool]:
     """Set password via ResetPassword.aspx + security-email OTC (HAR path).
 
     Returns ``(password, verified_ok)``.
     """
+    from securing.utils.proxy import microsoft_proxy_url
+
     pwd = strip_unverified(preferred_password) or generate_ms_password(16)
     if not email or not security_email:
         return pwd, False
 
+    proxy_url = microsoft_proxy_url(session)
     print("[~] - Force password via security-email OTP ResetPassword…")
     try:
-        ok = await reset_password_via_security_email_otp(email, security_email, pwd)
+        ok = await reset_password_via_security_email_otp(
+            email, security_email, pwd, proxy_url=proxy_url
+        )
     except Exception as exc:
         logger.exception("force password OTP ResetPassword raised: %s", exc)
         print(f"[X] - OTP ResetPassword error: {exc.__class__.__name__}")
@@ -73,7 +79,7 @@ async def force_password_via_otp(
         print("[~] - OTP ResetPassword retry with fresh password…")
         try:
             ok = await reset_password_via_security_email_otp(
-                email, security_email, pwd
+                email, security_email, pwd, proxy_url=proxy_url
             )
         except Exception:
             logger.exception("force password OTP retry raised")
@@ -128,6 +134,7 @@ async def force_password_after_recover(
             email=email,
             security_email=security_email,
             preferred_password=pwd,
+            session=session,
         )
         if ok:
             return pwd, rc, True
@@ -153,6 +160,7 @@ async def force_password_after_recover(
                 email=email,
                 security_email=security_email,
                 preferred_password=pwd,
+                session=session,
             )
             if ok2:
                 return pwd2, rc, True
@@ -164,6 +172,7 @@ async def force_password_after_recover(
                 email=email,
                 security_email=security_email,
                 preferred_password=pwd,
+                session=session,
             )
             if ok2:
                 return pwd2, rc, True
@@ -187,6 +196,7 @@ async def force_password_after_recover(
             email=email,
             security_email=security_email,
             preferred_password=pwd,
+            session=session,
         )
         if ok3:
             return pwd3, rc, True
@@ -283,6 +293,7 @@ async def ensure_password_verified(
                 email=email,
                 security_email=sec,
                 preferred_password=pwd,
+                session=session,
             )
             if ok:
                 ms["password"] = forced_pwd

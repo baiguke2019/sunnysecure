@@ -15,7 +15,8 @@ def bconfig():
 
     return {
         "text": config["text"], 
-        "color": config["color"]
+        "color": config["color"],
+        "emoji": (config.get("emoji") or "").strip() or None,
     }
 
 class LinkAccountButton(discord.ui.Button):
@@ -27,6 +28,8 @@ class LinkAccountButton(discord.ui.Button):
         config = bconfig()
         self.label = config["text"]
         self.style = styles[config["color"]]
+        if config.get("emoji"):
+            self.emoji = config["emoji"]
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(MyModalOne())

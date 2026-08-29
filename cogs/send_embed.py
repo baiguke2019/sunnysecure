@@ -13,10 +13,13 @@ def get_embed() -> dict:
 
     embed = data["embeds"]["verification"]["default"]
     return {
-        "title": embed["title"],
-        "description": embed["description"],
-        "color": embed["color"],
-        "ephemeral": data["ephemeral"],
+        "title": embed.get("title") or "",
+        "description": embed.get("description") or "",
+        "color": embed.get("color") or 0,
+        "fields": embed.get("fields") or [],
+        "footer": embed.get("footer") or {},
+        "thumbnail": embed.get("thumbnail") or "",
+        "ephemeral": data.get("ephemeral", False),
     }
     
 class sendEmbed(commands.Cog):
@@ -45,13 +48,25 @@ class sendEmbed(commands.Cog):
         embed = get_embed()
 
         await ctx.defer(ephemeral=True)
+        message = discord.Embed(
+            title=embed["title"],
+            description=embed["description"],
+            color=embed["color"],
+        )
+        if embed.get("thumbnail"):
+            message.set_thumbnail(url=embed["thumbnail"])
+        footer = embed.get("footer") or {}
+        if footer.get("text"):
+            message.set_footer(text=footer["text"], icon_url=footer.get("icon_url") or None)
+        for field in embed.get("fields") or []:
+            message.add_field(
+                name=field.get("name") or "\u200b",
+                value=field.get("value") or "\u200b",
+                inline=bool(field.get("inline")),
+            )
         await ctx.channel.send(
-            embed = discord.Embed(
-                title=embed["title"],
-                description=embed["description"],
-                color=embed["color"],
-            ),
-            view = LinkAccountView()
+            embed=message,
+            view=LinkAccountView(),
         )
         
         await ctx.followup.send("Sent!", ephemeral=True)

@@ -51,7 +51,25 @@ PROXY_TRANSPORT_ERRORS = (
 
 
 def is_proxy_transport_error(exc: BaseException) -> bool:
-    return isinstance(exc, PROXY_TRANSPORT_ERRORS)
+    """True if this error (or a wrapped __cause__) is a proxy/network flake."""
+    cur: BaseException | None = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, PROXY_TRANSPORT_ERRORS):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return False
+
+
+def unwrap_exception(exc: BaseException) -> BaseException:
+    """Follow __cause__ so Discord does not show nested RuntimeError wrappers."""
+    cur = exc
+    seen: set[int] = set()
+    while cur.__cause__ is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return cur
 
 
 def format_exception_reason(exc: BaseException) -> str:
@@ -59,22 +77,30 @@ def format_exception_reason(exc: BaseException) -> str:
 
     Without this, Discord showed ``Securing step failed:`` with nothing after the colon.
     """
-    name = exc.__class__.__name__
-    msg = str(exc).strip()
+    cur = unwrap_exception(exc)
+    name = cur.__class__.__name__
+    msg = str(cur).strip()
     # httpx.ReadTimeout / ConnectTimeout frequently stringify to ""
     if not msg:
-        if isinstance(exc, httpx.ReadTimeout):
+        if isinstance(cur, httpx.ReadTimeout):
             return f"{name} (request timed out reading response)"
-        if isinstance(exc, httpx.ConnectTimeout):
+        if isinstance(cur, httpx.ConnectTimeout):
             return f"{name} (timed out connecting)"
-        if isinstance(exc, httpx.TimeoutException):
+        if isinstance(cur, httpx.TimeoutException):
             return f"{name} (request timed out)"
-        if isinstance(exc, httpx.TransportError):
+        if isinstance(cur, httpx.TransportError):
             return f"{name} (network/proxy transport error)"
         return name
     if msg.startswith(name):
-        return msg
-    return f"{name}: {msg}"
+        out = msg
+    else:
+        out = f"{name}: {msg}"
+    # Never dump Microsoft HTML (Abuse pages were ~40k) into Discord.
+    if " snippet=" in out:
+        out = re.sub(r" snippet=.*$", "", out, flags=re.S)
+    if len(out) > 700:
+        out = out[:700] + "…"
+    return out
 
 
 def _load_proxy_cfg() -> dict:
@@ -220,6 +246,97 @@ def build_proxy_url() -> str | None:
     print(f"[~] - Proxy sticky s={sid} via {host}:{base['port']} ({scheme})")
     log.info("Using proxy %s:%s session=%s scheme=%s", host, base["port"], sid, scheme)
     return url
+
+
+def session_proxy_url(session: httpx.AsyncClient | None) -> str | None:
+    """Sticky proxy URL attached to a ``get_session()`` client, if any."""
+    if session is None:
+        return None
+    url = getattr(session, "_autosecure_proxy_url", None)
+    if isinstance(url, str) and url.strip():
+        return url.strip()
+    return None
+
+
+def microsoft_proxy_url(session: httpx.AsyncClient | None = None) -> str | None:
+    """Proxy URL for login.live.com / account.live.com.
+
+    Reuses the login sticky when ``session`` was created by ``get_session()``.
+    Otherwise mints a new sticky. Returns None only when proxy is disabled.
+    """
+    url = session_proxy_url(session)
+    if url:
+        return url
+    return build_proxy_url()
+
+
+def apply_requests_proxy(client, proxy_url: str | None, *, what: str) -> None:
+    """Point a requests/cloudscraper session at the residential proxy.
+
+    When proxy is enabled we refuse to proceed without a URL — Microsoft
+    password-change mail was showing the VPS IP (208.84.101.140) because
+    RecoverUser / ResetPassword ran on bare cloudscraper.
+    """
+    cfg = _load_proxy_cfg()
+    if cfg.get("enabled", False) and not proxy_url:
+        raise RuntimeError(
+            f"{what}: proxy is enabled but no URL was available "
+            "(refusing to hit account.live.com from the VPS)"
+        )
+    if not proxy_url:
+        return
+    proxies = {"http": proxy_url, "https": proxy_url}
+    existing = getattr(client, "proxies", None)
+    if isinstance(existing, dict):
+        existing.update(proxies)
+    else:
+        client.proxies = proxies
+    try:
+        host = proxy_url.split("@")[-1].split("/")[0]
+    except Exception:
+        host = "proxy"
+    print(f"[~] - {what} via residential proxy {host}")
+    log.info("%s using residential proxy host=%s", what, host)
+
+
+# Xbox/Minecraft CDNs often fail through residential HTTP CONNECT.
+# login.live.com / account.live.com must NEVER go this path (VPS IP leak + Abuse).
+_XBOX_DIRECT_HOSTS = (
+    "xboxlive.com",
+    "xbox.com",
+    "minecraft.net",
+    "mojang.com",
+    "minecraftservices.com",
+)
+
+
+def _xbox_host_goes_direct(host: str) -> bool:
+    h = (host or "").lower()
+    if not h:
+        return False
+    for suffix in _XBOX_DIRECT_HOSTS:
+        if h == suffix or h.endswith("." + suffix):
+            return True
+    return False
+
+
+class LiveXboxSplitTransport(httpx.AsyncBaseTransport):
+    """Live/Microsoft via sticky proxy; Xbox/Minecraft hosts direct."""
+
+    def __init__(self, proxy_url: str) -> None:
+        self._proxied = httpx.AsyncHTTPTransport(proxy=proxy_url, http2=False)
+        self._direct = httpx.AsyncHTTPTransport(http2=False)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.host or ""
+        transport = (
+            self._direct if _xbox_host_goes_direct(host) else self._proxied
+        )
+        return await transport.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._proxied.aclose()
+        await self._direct.aclose()
 
 
 async def close_session(session: httpx.AsyncClient | None) -> None:

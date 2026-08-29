@@ -112,6 +112,14 @@ def _is_ms_error_page(text: str, url: str = "") -> bool:
     return False
 
 
+def _is_abuse_page(text: str, url: str = "") -> bool:
+    u = (url or "").lower()
+    if "/abuse" in u:
+        return True
+    lower = (text or "").lower()
+    return "account.live.com/abuse" in lower or "/abuse?" in lower
+
+
 def _still_on_i5600(text: str) -> bool:
     pid = _page_id(text or "")
     if pid in ("i5600", "i5030"):
@@ -156,13 +164,18 @@ def _page_debug(text: str, *, url: str = "", status: int | None = None) -> str:
         flags.append("sFT")
     if "arruserproofs" in lower:
         flags.append("arrUserProofs")
+    if _is_abuse_page(text, url):
+        flags.append("Abuse")
     action = re.search(r'action="([^"]+)"', text, re.I)
-    return (
+    bits = (
         f"status={status} url={url!s} title={_title(text)!r} "
         f"pageId={_page_id(text)!r} "
         f"flags={flags} action={(action.group(1)[:180] if action else None)!r} "
-        f"len={len(text)} snippet={text[:500]!r}"
+        f"len={len(text)}"
     )
+    if "Abuse" in flags:
+        return bits
+    return f"{bits} snippet={text[:160]!r}"
 
 
 def _object_moved_href(text: str) -> str | None:
@@ -927,6 +940,13 @@ async def _bridge_to_proofs(
             )
             return current, current_url, current_status
 
+        if _is_abuse_page(current, current_url):
+            logging.warning(
+                "security_information: Microsoft Abuse page — stopping bridge (%s)",
+                _page_debug(current, url=current_url, status=current_status),
+            )
+            break
+
         fp = _page_fingerprint(current, current_url)
         seen[fp] = seen.get(fp, 0) + 1
         if seen[fp] >= 3:
@@ -1199,17 +1219,21 @@ async def security_information(
     if not match:
         _, missing = _sso_fields(text)
         pid = _page_id(text)
+        logging.error(
+            "security_information: no t0 after bridge — missing=%s %s",
+            missing,
+            _page_debug(text, url=url, status=status),
+        )
+        if _is_abuse_page(text, url):
+            raise RuntimeError(
+                "security_information: Microsoft Abuse/unusual-activity page"
+            )
         if pid == "i5600" or "help us protect" in (text or "").lower():
             raise RuntimeError(
-                "security_information: Help-us-protect (i5600) blocked proofs/Manage "
-                "after SSO bridge — password/OTP did not clear MFA. "
-                f"missing_sso_fields={missing} "
-                f"{_page_debug(text, url=url, status=status)}"
+                "security_information: Help-us-protect (i5600) blocked proofs/Manage"
             )
         raise RuntimeError(
-            "security_information: could not find var t0= on proofs page after SSO bridge. "
-            f"missing_sso_fields={missing} "
-            f"{_page_debug(text, url=url, status=status)}"
+            "security_information: could not find var t0= on proofs page after SSO bridge"
         )
 
     return match.group(1)

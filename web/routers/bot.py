@@ -145,11 +145,13 @@ def get_embeds(user: str = Depends(require_auth)):
 @router.post("/api/bot/embeds/verification")
 def save_verification_embed(body: VerificationEmbedRequest, user: str = Depends(require_auth)):
     bc = get_config()["web"]
-    bc.setdefault("embeds", {}).setdefault("verification", {})["default"] = {
+    existing = bc.setdefault("embeds", {}).setdefault("verification", {}).get("default") or {}
+    existing.update({
         "title": body.title,
         "description": body.description,
         "color": body.color,
-    }
+    })
+    bc.setdefault("embeds", {}).setdefault("verification", {})["default"] = existing
     bc["ephemeral"] = body.ephemeral
     with open("config/bot.json", "w") as f:
         json.dump(bc, f, indent=2)
@@ -164,7 +166,10 @@ def save_verification_button(body: VerificationButtonRequest, user: str = Depend
     if body.color not in valid_colors:
         raise HTTPException(400, detail=f"Invalid color. Use: {', '.join(valid_colors)}")
     bc = get_config()["web"]
-    bc["verification_button"] = {"text": body.text.strip(), "color": body.color}
+    btn = dict(bc.get("verification_button") or {})
+    btn["text"] = body.text.strip()
+    btn["color"] = body.color
+    bc["verification_button"] = btn
     with open("config/bot.json", "w") as f:
         json.dump(bc, f, indent=2)
     return {"ok": True}

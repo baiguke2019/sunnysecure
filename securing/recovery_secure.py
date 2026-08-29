@@ -499,6 +499,7 @@ async def recovery_secure(
                             email=email,
                             security_email=security_email,
                             preferred_password=password,
+                            session=session,
                         )
                         if forced_ok:
                             password = forced_pwd
@@ -543,6 +544,7 @@ async def recovery_secure(
                                 email=email,
                                 security_email=security_email,
                                 preferred_password=password,
+                                session=session,
                             )
                             if forced_ok:
                                 password = forced_pwd

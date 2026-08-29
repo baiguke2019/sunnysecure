@@ -87,9 +87,12 @@ async def livedata(session: httpx.AsyncClient) -> dict:
     last_html = ""
 
     for attempt in range(2):
+        logging.info("livedata attempt %s POST https://login.live.com", attempt + 1)
+        print(f"[~] - livedata attempt {attempt + 1}/2...", flush=True)
         response = await session.post(
             "https://login.live.com",
             follow_redirects=True,
+            timeout=httpx.Timeout(20.0, connect=8.0),
         )
         last_status = response.status_code
         last_html = response.text or ""
@@ -97,6 +100,7 @@ async def livedata(session: httpx.AsyncClient) -> dict:
         url_post = _extract_url_post(last_html)
         ppft = _extract_ppft(last_html)
         if url_post and ppft:
+            print(f"[+] - livedata OK (login form parsed)", flush=True)
             return {"urlPost": url_post, "ppft": ppft}
 
         # Already-signed-in sessions often get a blank/redirect page.

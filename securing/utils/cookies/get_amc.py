@@ -118,11 +118,7 @@ async def get_amc(session: httpx.AsyncClient) -> dict:
             await asyncio.sleep(1.2 * attempt)
 
     if last_exc is not None:
-        if isinstance(last_exc, RuntimeError):
-            raise last_exc
-        raise RuntimeError(
-            f"get_amc failed after retries: {format_exception_reason(last_exc)}"
-        ) from last_exc
+        raise last_exc
     raise RuntimeError(
         "Failed to scrape RequestVerificationTokens — session may be incomplete after polish."
     )

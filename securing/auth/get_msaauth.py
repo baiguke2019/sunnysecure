@@ -1,15 +1,15 @@
 from securing.auth.handle_redirects import handle_redirects, get_data
 from securing.auth.account_status import get_account_lock_reason
 from securing.utils.cookies.safe_cookies import (
-    cookies_as_dict,
     dedupe_cookies,
-    get_cookie,
     has_cookie,
 )
 from urllib.parse import quote
 import logging
 import httpx
 import re
+
+_LOGIN_TIMEOUT = httpx.Timeout(25.0, connect=10.0)
 
 async def get_msaauth(session: httpx.AsyncClient, email: str, flowtoken: str, odata: dict, code: str, ppft: str = None) -> dict | str | None:
     # First post request that gets __Host-MSAAUTH
@@ -37,7 +37,8 @@ async def get_msaauth(session: httpx.AsyncClient, email: str, flowtoken: str, od
                 "type": "21",
                 "PPFT": odata["ppft"]
             },
-            follow_redirects = True
+            follow_redirects = True,
+            timeout=_LOGIN_TIMEOUT,
         )
 
         urlPost = re.search(r'"urlPost"\s*:\s*"([^\"]+)"', loginData.text)
@@ -79,20 +80,25 @@ async def get_msaauth(session: httpx.AsyncClient, email: str, flowtoken: str, od
                     "Priority": "u=0, i"
                 },
                 data = payload,
-                follow_redirects = True
+                follow_redirects = True,
+                timeout=_LOGIN_TIMEOUT,
             )
 
-            print(f"Login attempt {i}")
-            logging.info(f"Login attempt {i+1} response: {loginData.text}")
+            print(f"[~] - Login attempt {i + 1}/2 status={loginData.status_code} len={len(loginData.text or '')}", flush=True)
+            logging.info(
+                "Login attempt %s status=%s bytes=%s",
+                i + 1,
+                loginData.status_code,
+                len(loginData.text or ""),
+            )
             urlPost = re.search(r'"urlPost"\s*:\s*"([^\"]+)"', loginData.text)
             dedupe_cookies(session)
-            print(cookies_as_dict(session))
             if has_cookie(session, "__Host-MSAAUTH"):
                 break
 
     dedupe_cookies(session)
     if has_cookie(session, "__Host-MSAAUTH"):
-        logging.info(f"MSAAUTH cookie for {email}: {get_cookie(session, '__Host-MSAAUTH')}")
+        logging.info("MSAAUTH cookie present for %s", email)
 
         if not urlPost:
             data = await handle_redirects(session, loginData.text)

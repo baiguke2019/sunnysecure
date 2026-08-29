@@ -10,6 +10,7 @@ import os
 
 from ui.buttons.link_account import LinkAccountView
 from ui.buttons.autobuy import AutobuyView
+from ui.buttons.create_ticket import CreateTicketView
 from database.database import DBConnection
 from mail.server import startServer
 
@@ -66,6 +67,7 @@ class DiscordBot(commands.Bot):
     async def on_ready(self):
         self.add_view(LinkAccountView())
         self.add_view(AutobuyView())
+        self.add_view(CreateTicketView())
         self._startup_guild_sync_done = True
 
         # Presence from the config

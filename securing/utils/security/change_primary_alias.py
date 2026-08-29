@@ -110,6 +110,45 @@ def _signin_name_from_manage(html: str) -> str | None:
     return None
 
 
+def _is_names_manage_html(html: str) -> bool:
+    """True when HTML is the aliases page, not login / i5600 / OAuth chrome.
+
+    Login and Help-us-protect pages also embed a canary. Treating those as
+    names/manage skipped SA elevation, then AddAssocId'd an alias that was
+    already there ('try again later') and never ran MakePrimary.
+    """
+    if not html:
+        return False
+    try:
+        from securing.utils.security_information import _page_id
+
+        pid = _page_id(html)
+    except Exception:
+        pid = None
+    blob = html.lower()
+    if pid in ("i5600", "i5030"):
+        return False
+    if "help us protect" in blob and "arruserproofs" in blob:
+        return False
+    markers = (
+        "idaliasemail",
+        "aliasremovelink",
+        "showmakeprimary",
+        "showunverifiedmakeprimary",
+        "managenamesform",
+        "note_makeprimary",
+        '"hpgid":200176',
+        '"hpgid": 200176',
+    )
+    if any(m in blob for m in markers):
+        return True
+    if _signin_name_from_manage(html) and (
+        "names/manage" in blob or "associatedid" in blob
+    ):
+        return True
+    return False
+
+
 def _has_make_primary_control(html: str, email: str) -> bool:
     """True if this address still has a Make primary control (still secondary)."""
     if not html or not email:
@@ -131,14 +170,29 @@ def _emails_from_manage(html: str) -> list[str]:
         re.DOTALL | re.I,
     ):
         found.append(m.group(1).strip().lower())
-    if not found:
+    # Secondary aliases also appear on Remove / Make-primary controls.
+    for m in re.finditer(
+        r'aliasRemoveLink[^>]*\bname=["\']([^"\']+@[^"\']+)',
+        html or "",
+        re.I,
+    ):
+        found.append(html_unescape(m.group(1)).strip().lower())
+    for m in re.finditer(
+        r"Show(?:Unverified)?MakePrimary\(\s*['\"]([^'\"]+@[^'\"]+)['\"]",
+        html or "",
+        re.I,
+    ):
+        found.append(m.group(1).strip().lower())
+    if not found and _is_names_manage_html(html):
         # Fallback: any email-looking tokens on the manage page
         for m in re.finditer(
             r"([a-zA-Z0-9._+-]+@[a-zA-Z0-9._-]+\.[a-zA-Z]{2,})",
             html or "",
         ):
             addr = m.group(1).strip().lower()
-            if addr not in found and not addr.endswith((".png", ".jpg", ".css", ".js")):
+            if addr.endswith((".png", ".jpg", ".css", ".js")):
+                continue
+            if addr not in found:
                 found.append(addr)
     # Primary is shown as membername, NOT idAliasEmail* — missing this made
     # MakePrimary look successful ("old gone") while the original login stayed primary.
@@ -146,18 +200,12 @@ def _emails_from_manage(html: str) -> list[str]:
     if member:
         found.insert(0, member)
     # Login/MFA pages mention the username — don't treat that as an alias list.
-    blob = (html or "").lower()
-    if "login.live.com" in blob or 'pageid" content="i5030"' in blob or 'pageid" content="i5600"' in blob:
+    # Do NOT use ``login.live.com in html``: real names/manage chrome includes
+    # that host and used to strip every secondary (including sunny*).
+    if not _is_names_manage_html(html):
         found = [e for e in found if member and e == member]
         if not found and member:
             found = [member]
-        out: list[str] = []
-        seen: set[str] = set()
-        for e in found:
-            if e not in seen:
-                seen.add(e)
-                out.append(e)
-        return out
     # de-dupe preserve order
     out: list[str] = []
     seen: set[str] = set()
@@ -231,7 +279,7 @@ async def _get_manage(session: httpx.AsyncClient) -> tuple[str, str | None, list
             )
             text = resp.text or ""
 
-    canary = _extract_canary(text)
+    canary = _extract_canary(text) if _is_names_manage_html(text) else None
     if canary:
         try:
             session.cookies.set("canary", canary, domain="account.live.com")
@@ -738,8 +786,8 @@ async def _elevate_for_names_manage(
     text = html or ""
     # Always chase continue / recover forms first
     text = await _follow_post_auth_forms(session, text, "")
-    canary = _extract_canary(text)
-    if canary and "names/manage" in text.lower() and _page_id(text) not in ("i5600", "i5030"):
+    canary = _extract_canary(text) if _is_names_manage_html(text) else None
+    if canary and _is_names_manage_html(text):
         return text, canary, _emails_from_manage(text)
 
     pid = _page_id(text)
@@ -810,7 +858,7 @@ async def change_primary_alias(
             return False
 
         html, canary, before = await _get_manage(session)
-        if not canary:
+        if not canary or not _is_names_manage_html(html):
             html, canary, before = await _elevate_for_names_manage(
                 session,
                 html,
@@ -855,7 +903,15 @@ async def change_primary_alias(
             )
             return False
 
-        already = full.lower() in before
+        already = full.lower() in {e.lower() for e in before}
+        if not already:
+            gct = await _gct_exists(full)
+            if gct:
+                print(
+                    f"[~] - Alias exists (GetCredentialType) ({full}) — "
+                    "promoting without AddAssocId"
+                )
+                already = True
         if already:
             print(f"[~] - Alias already present ({full}) — promoting")
         else:
