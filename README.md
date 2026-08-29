@@ -6,6 +6,13 @@ Request-based Microsoft account securing for Discord, with a built-in SMTP serve
 
 ---
 
+## Disclaimer
+
+Use at your own risk. Automating Microsoft account flows may violate Microsoft's Terms of Service. This software is for educational purposes. The fork maintainers and upstream authors are not responsible for account actions taken by Microsoft or third parties.
+This repository is a small cybersecurity project focused on Microsoft account security and automation. It contains several scripts that explore ways to improve account protection, including setting up two-factor authentication (2FA) and checking for possible security issues.
+
+The project was made mainly for learning and experimentation. It can be used by students, researchers, and people interested in cybersecurity to get a better idea of how account security works and how different security measures can help keep accounts and personal information safe.
+
 ## Fork changes
 
 This fork adds fixes and features on top of upstream:
@@ -362,14 +369,3 @@ Command names can be renamed in `config/bot.json` or the dashboard.
 | Web build fails on Node 20 | Run `node node_modules/vite/bin/vite.js build` inside `web/` |
 
 ---
-
-## Disclaimer
-
-Use at your own risk. Automating Microsoft account flows may violate Microsoft's Terms of Service. This software is for educational purposes. The fork maintainers and upstream authors are not responsible for account actions taken by Microsoft or third parties.
-
-**Do not commit** secrets or dumps. At minimum keep these out of git (see `.gitignore`):
-
-- `config/config.json` — bot token, webhooks, proxies, LTC WIF
-- `.env` / `.env.*`
-- `database/*.db` — secured accounts
-- `logs/`, `*.har`, cookie/cache dumps, `proxy_list.txt`, wallet keys
